@@ -1,0 +1,940 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Northbound — everyday essentials, shipped across borders</title>
+    <style>
+      :root {
+        --ink: #16161d;
+        --muted: #6b7280;
+        --line: #e6e6ea;
+        --bg: #ffffff;
+        --bg-soft: #f6f6f4;
+        --brand: #4f46e5;
+        --brand-ink: #3730a3;
+        --brand-wash: #f1f0fe;
+        --ok: #047857;
+        --err: #b91c1c;
+        --radius: 14px;
+        --shadow: 0 1px 2px rgba(16, 16, 29, 0.04), 0 8px 24px rgba(16, 16, 29, 0.06);
+        --maxw: 1120px;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      [hidden] {
+        display: none !important;
+      }
+
+      /* ---------- Nav ---------- */
+      .nav {
+        position: sticky;
+        top: 0;
+        z-index: 30;
+        background: rgba(255, 255, 255, 0.85);
+        backdrop-filter: saturate(180%) blur(12px);
+        border-bottom: 1px solid var(--line);
+      }
+      .nav-inner {
+        max-width: var(--maxw);
+        margin: 0 auto;
+        padding: 14px 20px;
+        display: flex;
+        align-items: center;
+        gap: 20px;
+      }
+      .brand {
+        font-weight: 800;
+        font-size: 1.15rem;
+        letter-spacing: -0.02em;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+      }
+      .brand .mark {
+        display: inline-grid;
+        place-items: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        background: var(--ink);
+        color: #fff;
+        font-size: 0.8rem;
+      }
+      .nav-links {
+        display: none;
+        gap: 22px;
+        margin-left: 4px;
+        font-size: 0.92rem;
+        color: #3a3a44;
+      }
+      .nav-links a:hover {
+        color: var(--brand);
+      }
+      .nav-right {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .ccy-select {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 999px;
+        padding: 8px 12px;
+        font-size: 0.88rem;
+        font-family: inherit;
+        color: var(--ink);
+        cursor: pointer;
+      }
+      .icon-btn {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 999px;
+        padding: 8px 14px;
+        font-size: 0.9rem;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--ink);
+      }
+      .icon-btn:hover {
+        border-color: #c9c9d1;
+      }
+      .cart-count {
+        background: var(--brand);
+        color: #fff;
+        border-radius: 999px;
+        min-width: 20px;
+        height: 20px;
+        padding: 0 6px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        display: inline-grid;
+        place-items: center;
+      }
+      @media (min-width: 820px) {
+        .nav-links {
+          display: flex;
+        }
+      }
+
+      /* ---------- Hero ---------- */
+      .hero {
+        background:
+          radial-gradient(1200px 400px at 80% -10%, rgba(79, 70, 229, 0.18), transparent 60%),
+          linear-gradient(180deg, #14141b, #23232f);
+        color: #fff;
+      }
+      .hero-inner {
+        max-width: var(--maxw);
+        margin: 0 auto;
+        padding: 72px 20px 84px;
+      }
+      .eyebrow {
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 0.72rem;
+        color: #b9b7f5;
+        margin: 0 0 14px;
+        font-weight: 700;
+      }
+      .hero h1 {
+        font-size: clamp(2rem, 5vw, 3.4rem);
+        line-height: 1.05;
+        letter-spacing: -0.03em;
+        margin: 0 0 16px;
+        max-width: 15ch;
+      }
+      .hero p.sub {
+        color: #cfcfe0;
+        font-size: 1.05rem;
+        max-width: 46ch;
+        margin: 0 0 28px;
+      }
+      .btn-primary {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: #fff;
+        color: #14141b;
+        font-weight: 650;
+        padding: 12px 22px;
+        border-radius: 999px;
+        border: none;
+        cursor: pointer;
+        font-size: 0.98rem;
+      }
+
+      /* ---------- Shop grid ---------- */
+      .wrap {
+        max-width: var(--maxw);
+        margin: 0 auto;
+        padding: 56px 20px 40px;
+      }
+      .shop-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 24px;
+      }
+      .shop-head h2 {
+        font-size: 1.6rem;
+        letter-spacing: -0.02em;
+        margin: 0;
+      }
+      .shop-head p {
+        color: var(--muted);
+        margin: 0;
+        font-size: 0.92rem;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+        gap: 22px;
+      }
+      .product {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        overflow: hidden;
+        background: var(--bg);
+        display: flex;
+        flex-direction: column;
+        cursor: pointer;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+      .product:hover {
+        transform: translateY(-3px);
+        box-shadow: var(--shadow);
+      }
+      .thumb {
+        aspect-ratio: 4 / 3;
+        display: grid;
+        place-items: center;
+        font-size: 3.4rem;
+        position: relative;
+      }
+      .thumb .tag {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        background: rgba(255, 255, 255, 0.9);
+        color: #16161d;
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        padding: 4px 9px;
+        border-radius: 999px;
+      }
+      .product-body {
+        padding: 14px 15px 16px;
+        display: grid;
+        gap: 4px;
+      }
+      .product .cat {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+      .product .name {
+        font-weight: 650;
+        font-size: 1rem;
+      }
+      .product .price {
+        font-weight: 750;
+        font-size: 1.05rem;
+        margin-top: 6px;
+      }
+      .link-row {
+        margin-top: 10px;
+        font-size: 0.86rem;
+        color: var(--brand);
+        font-weight: 600;
+      }
+
+      /* ---------- PDP ---------- */
+      .breadcrumb {
+        font-size: 0.85rem;
+        color: var(--muted);
+        margin-bottom: 20px;
+      }
+      .breadcrumb a {
+        color: var(--muted);
+        cursor: pointer;
+      }
+      .breadcrumb a:hover {
+        color: var(--brand);
+      }
+      .pdp {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 44px;
+        align-items: start;
+      }
+      @media (max-width: 800px) {
+        .pdp {
+          grid-template-columns: 1fr;
+          gap: 28px;
+        }
+      }
+      .pdp-gallery {
+        border-radius: var(--radius);
+        aspect-ratio: 1 / 1;
+        display: grid;
+        place-items: center;
+        font-size: 8rem;
+      }
+      .pdp-info h1 {
+        font-size: 1.9rem;
+        letter-spacing: -0.02em;
+        margin: 6px 0 10px;
+      }
+      .pdp-info .cat {
+        font-size: 0.74rem;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+      }
+      .pdp-price {
+        font-size: 1.7rem;
+        font-weight: 780;
+        margin: 4px 0 6px;
+      }
+      .pdp-desc {
+        color: #3a3a44;
+        margin: 14px 0 18px;
+      }
+      .features {
+        list-style: none;
+        padding: 0;
+        margin: 0 0 22px;
+        display: grid;
+        gap: 8px;
+      }
+      .features li {
+        font-size: 0.9rem;
+        color: #3a3a44;
+        padding-left: 24px;
+        position: relative;
+      }
+      .features li::before {
+        content: '✓';
+        position: absolute;
+        left: 0;
+        color: var(--brand);
+        font-weight: 700;
+      }
+      .buy-row {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+      }
+      .field {
+        display: grid;
+        gap: 5px;
+        font-size: 0.78rem;
+        color: var(--muted);
+      }
+      .buy {
+        border: none;
+        background: var(--ink);
+        color: #fff;
+        padding: 13px 26px;
+        border-radius: 10px;
+        font-size: 0.95rem;
+        font-weight: 650;
+        cursor: pointer;
+      }
+      .buy:hover {
+        background: var(--brand);
+      }
+
+      /* ---------- Open Border "where it's used" callouts ---------- */
+      .ob-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-family: ui-monospace, monospace;
+        font-size: 0.72rem;
+        font-weight: 600;
+        color: var(--brand-ink);
+        background: var(--brand-wash);
+        border: 1px solid #d9d6fb;
+        border-radius: 999px;
+        padding: 3px 9px;
+      }
+      .ob-callout {
+        border: 1px solid #d9d6fb;
+        background: var(--brand-wash);
+        border-radius: 12px;
+        padding: 14px 16px;
+        font-size: 0.84rem;
+        color: #3a3856;
+      }
+      .ob-callout h4 {
+        margin: 0 0 8px;
+        font-size: 0.86rem;
+        color: var(--brand-ink);
+      }
+      .ob-callout ol {
+        margin: 8px 0 0;
+        padding-left: 18px;
+        display: grid;
+        gap: 5px;
+      }
+      .ob-callout code {
+        font-family: ui-monospace, monospace;
+        background: #fff;
+        border: 1px solid #e3e1fb;
+        border-radius: 5px;
+        padding: 1px 5px;
+        font-size: 0.8rem;
+      }
+      /* ---------- Value props ---------- */
+      .props {
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        background: var(--bg-soft);
+      }
+      .props-inner {
+        max-width: var(--maxw);
+        margin: 0 auto;
+        padding: 26px 20px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 18px;
+      }
+      .prop {
+        display: flex;
+        gap: 12px;
+        align-items: flex-start;
+      }
+      .prop .pi {
+        font-size: 1.2rem;
+      }
+      .prop h4 {
+        margin: 0 0 2px;
+        font-size: 0.92rem;
+      }
+      .prop p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.84rem;
+      }
+
+      /* ---------- Footer ---------- */
+      .footer {
+        background: #14141b;
+        color: #cfcfd8;
+        margin-top: 48px;
+      }
+      .footer-inner {
+        max-width: var(--maxw);
+        margin: 0 auto;
+        padding: 46px 20px 26px;
+        display: grid;
+        grid-template-columns: 1.4fr 1fr 1fr 1fr;
+        gap: 24px;
+      }
+      .footer h5 {
+        color: #fff;
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin: 0 0 12px;
+      }
+      .footer a {
+        display: block;
+        color: #a6a6b3;
+        font-size: 0.88rem;
+        padding: 4px 0;
+      }
+      .footer a:hover {
+        color: #fff;
+      }
+      .footer .brand {
+        color: #fff;
+        margin-bottom: 10px;
+      }
+      .footer .blurb {
+        color: #9a9aa8;
+        font-size: 0.86rem;
+        max-width: 32ch;
+      }
+      .footer-bottom {
+        border-top: 1px solid #2a2a36;
+        color: #82828f;
+        font-size: 0.8rem;
+        text-align: center;
+        padding: 16px;
+      }
+      @media (max-width: 720px) {
+        .footer-inner {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+
+      /* ---------- Checkout drawer ---------- */
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(16, 16, 29, 0.45);
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 0.2s ease;
+        z-index: 40;
+      }
+      .overlay.open {
+        opacity: 1;
+        visibility: visible;
+      }
+      .drawer {
+        position: fixed;
+        top: 0;
+        right: 0;
+        height: 100%;
+        width: 452px;
+        max-width: 100vw;
+        background: #fff;
+        z-index: 50;
+        transform: translateX(100%);
+        transition: transform 0.25s ease;
+        display: flex;
+        flex-direction: column;
+        box-shadow: -12px 0 40px rgba(16, 16, 29, 0.16);
+      }
+      .drawer.open {
+        transform: translateX(0);
+      }
+      .drawer-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 18px 20px;
+        border-bottom: 1px solid var(--line);
+      }
+      .drawer-head h2 {
+        margin: 0;
+        font-size: 1.1rem;
+      }
+      .drawer-close {
+        border: none;
+        background: none;
+        font-size: 1.5rem;
+        line-height: 1;
+        cursor: pointer;
+        color: var(--muted);
+      }
+      .drawer-body {
+        padding: 18px 20px 28px;
+        overflow-y: auto;
+      }
+      .summary {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        margin-bottom: 16px;
+      }
+      .summary .sthumb {
+        width: 56px;
+        height: 56px;
+        border-radius: 10px;
+        display: grid;
+        place-items: center;
+        font-size: 1.7rem;
+        flex: none;
+      }
+      .summary .sname {
+        font-weight: 650;
+      }
+      .summary .smeta {
+        font-size: 0.75rem;
+        color: var(--muted);
+        font-family: ui-monospace, monospace;
+      }
+      .summary .sprice {
+        margin-left: auto;
+        font-weight: 750;
+      }
+      .ccy-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        margin-bottom: 4px;
+        font-size: 0.85rem;
+      }
+      .ccy-row .ccy-hint {
+        color: var(--muted);
+        font-size: 0.74rem;
+      }
+      .drawer h3 {
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin: 22px 0 12px;
+      }
+      label.stack {
+        display: grid;
+        gap: 5px;
+        font-size: 0.82rem;
+        margin-bottom: 11px;
+        color: #3a3a44;
+      }
+      input {
+        padding: 10px 12px;
+        border: 1px solid #d7d7de;
+        border-radius: 9px;
+        font-size: 0.95rem;
+        font-family: inherit;
+      }
+      input:focus {
+        outline: none;
+        border-color: var(--brand);
+        box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.14);
+      }
+      .stack select {
+        padding: 10px 12px;
+        border: 1px solid #d7d7de;
+        border-radius: 9px;
+        font-size: 0.95rem;
+        font-family: inherit;
+        background: #fff;
+      }
+      .two {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 11px;
+      }
+      .totals {
+        margin: 0;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 5px 12px;
+        font-size: 0.88rem;
+      }
+      .totals dt {
+        color: var(--muted);
+      }
+      .totals dd {
+        margin: 0;
+        text-align: right;
+        font-family: ui-monospace, monospace;
+      }
+      .totals dd.tot-total {
+        font-weight: 750;
+      }
+      .totals-note {
+        color: var(--muted);
+        font-size: 0.76rem;
+        margin: 8px 0 0;
+      }
+      .payment-placeholder {
+        margin-top: 4px;
+        border: 1px dashed #c7c9d3;
+        border-radius: 10px;
+        padding: 14px;
+        color: var(--muted);
+        background: var(--bg-soft);
+        font-size: 0.85rem;
+        line-height: 1.45;
+      }
+      #receipt-card[hidden] {
+        display: none;
+      }
+      .receipt {
+        margin-top: 18px;
+        border-radius: 12px;
+        padding: 16px;
+        font-size: 0.86rem;
+      }
+      .receipt.ok {
+        background: #ecfdf5;
+        border: 1px solid #a7f3d0;
+        color: #065f46;
+      }
+      .receipt.err {
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        color: var(--err);
+      }
+      .receipt.pending {
+        background: var(--bg-soft);
+        border: 1px solid var(--line);
+        color: var(--muted);
+      }
+      .receipt h4 {
+        margin: 0 0 8px;
+        font-size: 1rem;
+      }
+      .receipt dl {
+        margin: 0;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 4px 12px;
+      }
+      .receipt dt {
+        opacity: 0.7;
+      }
+      .receipt dd {
+        margin: 0;
+        font-family: ui-monospace, monospace;
+        text-align: right;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="nav">
+      <div class="nav-inner">
+        <a class="brand" id="brand-home"><span class="mark">◆</span> Northbound</a>
+        <nav class="nav-links">
+          <a data-nav-home>Shop</a><a data-nav-home>New in</a><a data-nav-home>Collections</a
+          ><a data-nav-home>Sale</a>
+        </nav>
+        <div class="nav-right">
+          <select class="ccy-select" id="nav-ccy" aria-label="Currency">
+            <option value="USD">🌎 USD</option>
+            <option value="GBP">🌍 GBP</option>
+            <option value="EUR">🌍 EUR</option>
+            <option value="CAD">🌎 CAD</option>
+            <option value="AUD">🌏 AUD</option>
+          </select>
+          <button class="icon-btn" id="cart-btn" type="button" aria-label="Bag">
+            🛍️ <span class="cart-count" id="cart-count">0</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <div id="view-shop">
+      <section class="hero" id="top">
+        <div class="hero-inner">
+          <p class="eyebrow">New season · Ships worldwide</p>
+          <h1>Everyday essentials, shipped across borders.</h1>
+          <p class="sub">
+            One checkout, five currencies. Pick your currency and pay locally — we handle the
+            duties, taxes, and the rest.
+          </p>
+          <button class="btn-primary" id="hero-cta" type="button">Shop the collection →</button>
+        </div>
+      </section>
+
+      <main class="wrap" id="shop">
+        <div class="shop-head">
+          <h2>Shop the collection</h2>
+          <p>Prices shown in <strong id="shop-ccy-label">USD</strong> — change it in the top bar.</p>
+        </div>
+        <div class="grid" id="product-grid"></div>
+      </main>
+
+      <section class="props">
+        <div class="props-inner">
+          <div class="prop">
+            <span class="pi">🌍</span>
+            <div><h4>Local currency pricing</h4><p>Checkout in USD, GBP, EUR, CAD, or AUD.</p></div>
+          </div>
+          <div class="prop">
+            <span class="pi">🧾</span>
+            <div><h4>Duties &amp; taxes handled</h4><p>No surprise fees at your door.</p></div>
+          </div>
+          <div class="prop">
+            <span class="pi">🔒</span>
+            <div><h4>Secure checkout</h4><p>Your card is encrypted end to end.</p></div>
+          </div>
+          <div class="prop">
+            <span class="pi">↩️</span>
+            <div><h4>Free 30-day returns</h4><p>Changed your mind? Send it back.</p></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div id="view-product" hidden>
+      <main class="wrap">
+        <div class="breadcrumb"><a id="crumb-shop">Shop</a> / <span id="crumb-name"></span></div>
+        <div class="pdp">
+          <div class="pdp-gallery" id="pdp-gallery"></div>
+          <div class="pdp-info">
+            <div class="cat" id="pdp-cat"></div>
+            <h1 id="pdp-name"></h1>
+            <div class="pdp-price" id="pdp-price"></div>
+            <div class="smeta" id="pdp-route" style="font-family: ui-monospace, monospace; color: #6b7280; font-size: 0.8rem;"></div>
+            <p class="pdp-desc" id="pdp-desc"></p>
+            <ul class="features" id="pdp-features"></ul>
+
+            <div class="buy-row">
+              <label class="field">
+                Currency
+                <select class="ccy-select" id="pdp-ccy" aria-label="Charge currency">
+                  <option value="USD">USD</option>
+                  <option value="GBP">GBP</option>
+                  <option value="EUR">EUR</option>
+                  <option value="CAD">CAD</option>
+                  <option value="AUD">AUD</option>
+                </select>
+              </label>
+              <button class="buy" id="pdp-add" type="button">Add to bag</button>
+            </div>
+
+            <div class="ob-callout" style="margin-top: 18px">
+              <h4>🔌 How this checkout works (Open Border)</h4>
+              This store never sees a card or a payment-processor key — it only uses two Open Border
+              packages:
+              <ol>
+                <li>
+                  <span class="ob-tag">@open-border/js</span> — the browser embed. Loaded from the CDN,
+                  authenticated with the <strong>publishable</strong> key (<code>pk_</code>). It
+                  collects the card and returns a token (<code>pm_</code>). The
+                  <strong>product currency you pick above</strong> tells it which Open Border entity
+                  to route to.
+                </li>
+                <li>
+                  <span class="ob-tag">@open-border/node</span> — the backend SDK. Our server takes
+                  that <code>pm_</code>, quotes <strong>duties &amp; taxes</strong> for the ship-to
+                  address (<code>createTaxQuote</code>), then calls <code>createPaymentIntent</code>
+                  with the <strong>secret</strong> key (<code>sk_</code>) to make the charge.
+                </li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <div>
+          <div class="brand"><span class="mark">◆</span> Northbound</div>
+          <p class="blurb">Considered essentials for people who move across borders.</p>
+        </div>
+        <div>
+          <h5>Shop</h5>
+          <a data-nav-home>New in</a><a data-nav-home>Apparel</a><a data-nav-home>Accessories</a
+          ><a data-nav-home>Footwear</a>
+        </div>
+        <div>
+          <h5>Help</h5>
+          <a href="#">Shipping</a><a href="#">Returns</a><a href="#">Size guide</a
+          ><a href="#">Contact</a>
+        </div>
+        <div>
+          <h5>Company</h5>
+          <a href="#">About</a><a href="#">Sustainability</a><a href="#">Careers</a>
+        </div>
+      </div>
+      <div class="footer-bottom">© 2026 Northbound. Cross-border checkout powered by Open Border.</div>
+    </footer>
+
+    <div class="overlay" id="overlay"></div>
+    <aside class="drawer" id="drawer" aria-hidden="true" aria-label="Checkout">
+      <div class="drawer-head">
+        <h2>Checkout</h2>
+        <button class="drawer-close" id="drawer-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="drawer-body">
+        <div class="summary">
+          <div class="sthumb" id="sum-thumb"></div>
+          <div>
+            <div class="sname" id="sum-name"></div>
+            <div class="smeta" id="sum-meta"></div>
+          </div>
+          <div class="sprice" id="sum-price"></div>
+        </div>
+
+        <div class="ccy-row">
+          <label class="field" style="flex-direction: row; align-items: center; gap: 8px;">
+            Charge currency
+            <select class="ccy-select" id="drawer-ccy" aria-label="Charge currency">
+              <option value="USD">USD</option>
+              <option value="GBP">GBP</option>
+              <option value="EUR">EUR</option>
+              <option value="CAD">CAD</option>
+              <option value="AUD">AUD</option>
+            </select>
+          </label>
+          <span class="ccy-hint">Changing this reloads the card form on the new entity.</span>
+        </div>
+
+        <h3>Contact &amp; shipping</h3>
+        <label class="stack">Email<input id="email" type="email" placeholder="you@example.com" /></label>
+        <label class="stack">Name<input id="name" type="text" placeholder="Ada Lovelace" /></label>
+        <label class="stack">Address<input id="line1" type="text" placeholder="1 Market St" /></label>
+        <div class="two">
+          <label class="stack">City<input id="city" type="text" placeholder="San Francisco" /></label>
+          <label class="stack">Postal code<input id="postal_code" type="text" placeholder="94105" /></label>
+        </div>
+        <label class="stack"
+          >Country
+          <select id="country">
+            <option value="US" selected>United States (domestic)</option>
+            <option value="GB">United Kingdom</option>
+            <option value="CA">Canada</option>
+            <option value="AU">Australia</option>
+            <option value="DE">Germany</option>
+            <option value="FR">France</option>
+            <option value="NL">Netherlands</option>
+            <option value="IE">Ireland</option>
+            <option value="JP">Japan</option>
+            <option value="SG">Singapore</option>
+          </select>
+        </label>
+
+        <h3>Order total</h3>
+        <dl class="totals">
+          <dt>Subtotal</dt>
+          <dd id="tot-sub">—</dd>
+          <dt>Tax</dt>
+          <dd id="tot-tax">—</dd>
+          <dt>Duty</dt>
+          <dd id="tot-duty">—</dd>
+          <dt>Total</dt>
+          <dd id="tot-total" class="tot-total">—</dd>
+        </dl>
+        <p class="totals-note" id="totals-note"></p>
+
+        <h3>Payment</h3>
+        <div id="ob-checkout"></div>
+
+        <div id="receipt-card" hidden><div id="receipt"></div></div>
+      </div>
+    </aside>
+
+    <script src="/config.js"></script>
+    <script src="https://unpkg.com/@open-border/js@0.4.0"></script>
+    <script src="/checkout.js"></script>
+  </body>
+</html>
