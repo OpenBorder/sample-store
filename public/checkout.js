@@ -105,13 +105,15 @@ function renderPaymentPlaceholder(message) {
 function renderGrid() {
   const grid = $('product-grid');
   grid.innerHTML = '';
-  for (const product of PRODUCTS) {
+  for (const [index, product] of PRODUCTS.entries()) {
     const card = document.createElement('article');
     card.className = 'product';
     card.dataset.id = product.id;
     card.innerHTML =
       `<div class="thumb" style="background: linear-gradient(135deg, ${product.grad[0]}, ${product.grad[1]})">` +
-      `<span class="tag">${product.cat}</span>${product.emoji}</div>` +
+      `<span class="tag">${product.cat}</span>` +
+      `<span class="thumb-index">0${index + 1}</span>` +
+      `<span class="thumb-object" aria-hidden="true">${product.emoji}</span></div>` +
       '<div class="product-body">' +
       `<div class="cat">${product.cat}</div>` +
       `<div class="name">${product.name}</div>` +
@@ -128,7 +130,14 @@ function renderPDP(product) {
   const ccy = state.currency;
   const g = $('pdp-gallery');
   g.style.background = `linear-gradient(135deg, ${product.grad[0]}, ${product.grad[1]})`;
-  g.textContent = product.emoji;
+  g.innerHTML =
+    `<span class="gallery-label">Northbound essentials</span>` +
+    `<span class="gallery-index">0${PRODUCTS.indexOf(product) + 1} / 0${PRODUCTS.length}</span>` +
+    `<span class="gallery-object" aria-hidden="true">${product.emoji}</span>` +
+    '<div class="gallery-caption">' +
+    `<strong>${product.name}</strong>` +
+    `<span>${product.cat} · designed for everyday movement</span>` +
+    '</div>';
   $('crumb-name').textContent = product.name;
   $('pdp-cat').textContent = product.cat;
   $('pdp-name').textContent = product.name;
@@ -206,7 +215,7 @@ function renderOrderSummary() {
   const amount = product.prices[ccy];
   const thumb = $('sum-thumb');
 
-  thumb.textContent = product.emoji;
+  thumb.innerHTML = `<span class="summary-thumb-object" aria-hidden="true">${product.emoji}</span>`;
   thumb.style.background = `linear-gradient(135deg, ${product.grad[0]}, ${product.grad[1]})`;
   $('sum-name').textContent = product.name;
   $('sum-meta').textContent = `${ccy} → ${ENTITY[ccy]}`;
