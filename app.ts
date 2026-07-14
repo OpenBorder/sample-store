@@ -106,6 +106,14 @@ const isProductId = (value: unknown): value is ProductId =>
 const cleanString = (value: unknown, max: number) =>
   typeof value === 'string' && value.trim().length <= max ? value.trim() : '';
 
+function isValidEmail(value: string) {
+  if (!value || [...value].some((character) => character.trim() === '')) return false;
+  const at = value.indexOf('@');
+  if (at <= 0 || at !== value.lastIndexOf('@')) return false;
+  const dot = value.indexOf('.', at + 2);
+  return dot > at + 1 && dot < value.length - 1;
+}
+
 function parseCheckoutInput(value: unknown, requireBuyer: boolean): CheckoutInput {
   if (!isObject(value)) throw new RequestValidationError({ body: 'Expected a JSON object.' });
 
@@ -133,7 +141,7 @@ function parseCheckoutInput(value: unknown, requireBuyer: boolean): CheckoutInpu
   if (requireBuyer && !address.line1) fields.line1 = 'Address is required.';
 
   const email = cleanString(value.email, 254);
-  if (requireBuyer && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fields.email = 'Enter a valid email.';
+  if (requireBuyer && !isValidEmail(email)) fields.email = 'Enter a valid email.';
 
   if (isProductId(productId) && isCurrency(currency)) {
     const expected = CATALOG[productId].prices[currency];

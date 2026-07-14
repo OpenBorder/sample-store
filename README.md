@@ -79,7 +79,7 @@ npm run check:secrets
 
 The tests cover catalog tampering, signed displayed quotes, same-key retries, changed-request
 rejection, provider-safe errors, malformed JSON, the local throttle, and live-key refusal. CI also
-runs Gitleaks across repository history.
+runs the repository secret scanner on every tracked and untracked source file.
 
 For a sustained public deployment, add a platform-level rate-limit rule for `/quote` and
 `/charge`. An in-process limiter resets with serverless instances and is only a local safety net.
