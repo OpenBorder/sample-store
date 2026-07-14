@@ -11,5 +11,5 @@
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
-  "include": ["app.ts", "server.ts", "api"]
+  "include": ["app.ts", "server.ts", "api", "tests"]
 }

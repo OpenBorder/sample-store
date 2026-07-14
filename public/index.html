@@ -34,6 +34,16 @@
         line-height: 1.5;
         -webkit-font-smoothing: antialiased;
       }
+      .demo-rail {
+        padding: 7px 20px;
+        background: #d8ff64;
+        color: #182006;
+        text-align: center;
+        font-size: 0.76rem;
+        font-weight: 760;
+        letter-spacing: 0.035em;
+        text-transform: uppercase;
+      }
       a {
         color: inherit;
         text-decoration: none;
@@ -715,9 +725,16 @@
         font-family: ui-monospace, monospace;
         text-align: right;
       }
+      .request-ref {
+        margin: 10px 0 0;
+        font-family: ui-monospace, monospace;
+        font-size: 0.72rem;
+        opacity: 0.75;
+      }
     </style>
   </head>
   <body>
+    <div class="demo-rail">Open Border test mode · Demo payments only · Live keys are refused</div>
     <header class="nav">
       <div class="nav-inner">
         <a class="brand" id="brand-home"><span class="mark">◆</span> Northbound</a>
@@ -929,7 +946,7 @@
         <h3>Payment</h3>
         <div id="ob-checkout"></div>
 
-        <div id="receipt-card" hidden><div id="receipt"></div></div>
+        <div id="receipt-card" aria-live="polite" hidden><div id="receipt"></div></div>
       </div>
     </aside>
 

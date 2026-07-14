@@ -43,12 +43,42 @@ const $ = (id) => document.getElementById(id);
 const price = (amount, currency) =>
   new Intl.NumberFormat('en', { style: 'currency', currency }).format(amount / 100);
 
-const state = { currency: 'USD', product: null, breakdown: null };
+const state = {
+  currency: 'USD',
+  product: null,
+  breakdown: null,
+  checkoutId: crypto.randomUUID(),
+  quoteToken: null,
+  ambiguousRetry: false,
+  ambiguousProductId: null,
+};
 
 const overlay = $('overlay');
 const drawer = $('drawer');
 const receiptCard = $('receipt-card');
 const receipt = $('receipt');
+
+const escapeHtml = (value) =>
+  String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+
+function resetCheckout() {
+  state.checkoutId = crypto.randomUUID();
+  state.quoteToken = null;
+  state.breakdown = null;
+  state.ambiguousRetry = false;
+  state.ambiguousProductId = null;
+}
+
+function setCheckoutLocked(locked) {
+  for (const id of ['email', 'name', 'line1', 'city', 'postal_code', 'country', 'drawer-ccy']) {
+    $(id).disabled = locked;
+  }
+}
 
 
 const ob = OpenBorder(OB_CONFIG.publishableKey, { apiBaseUrl: OB_CONFIG.apiBaseUrl });
@@ -148,7 +178,10 @@ function setCurrency(ccy) {
   if (!$('view-product').hidden && state.product) renderPDP(state.product);
   // A currency change while the drawer is open must reload the payment element on the new
   // entity's account — the embed takes `currency` at mount, so re-mount it.
-  if (drawer.classList.contains('open') && state.product) updateDrawer();
+  if (drawer.classList.contains('open') && state.product) {
+    resetCheckout();
+    updateDrawer();
+  }
 }
 
 /* ---------------- Checkout drawer ---------------- */
@@ -189,6 +222,7 @@ async function refreshQuote() {
   const ccy = state.currency;
   const seq = ++quoteSeq;
   state.breakdown = null;
+  state.quoteToken = null;
   renderTotals(null, 'Calculating duties & taxes for your address…');
   renderPaymentPlaceholder('Calculating final total before payment…');
   try {
@@ -196,11 +230,11 @@ async function refreshQuote() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        productName: product.name,
-        hsCode: product.hs,
+        checkoutId: state.checkoutId,
+        productId: product.id,
         currency: ccy,
         amount: product.prices[ccy],
-        address: buyer().address,
+        ...buyer(),
       }),
     });
     const data = await res.json();
@@ -211,6 +245,7 @@ async function refreshQuote() {
       return false;
     }
     state.breakdown = data.amount_breakdown;
+    state.quoteToken = data.quoteToken;
     renderTotals(
       data.amount_breakdown,
       data.domestic
@@ -240,7 +275,7 @@ function mountEmbed() {
   const ccy = state.currency;
   const amount = product.prices[ccy];
 
-  if (!state.breakdown) {
+  if (!state.breakdown || !state.quoteToken) {
     renderPaymentPlaceholder('Payment is unavailable until duties & taxes can be quoted.');
     return;
   }
@@ -264,40 +299,83 @@ function mountEmbed() {
         renderReceipt('err', '<h4>Payment unavailable</h4><p>Duties & taxes must be quoted before paying.</p>');
         throw new Error('quote_missing');
       }
+      if (!state.quoteToken) {
+        renderReceipt('err', '<h4>Quote expired</h4><p>Refresh the order total before paying.</p>');
+        throw new Error('quote_missing');
+      }
       renderReceipt('pending', 'Processing your payment…');
       let data;
       try {
         const res = await fetch('/charge', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ paymentMethodId, productName: product.name, hsCode: product.hs, currency: ccy, amount, ...details }),
+          body: JSON.stringify({
+            checkoutId: state.checkoutId,
+            quoteToken: state.quoteToken,
+            paymentMethodId,
+            productId: product.id,
+            currency: ccy,
+            amount,
+            ...details,
+          }),
         });
         data = await res.json();
       } catch {
-        renderReceipt('err', '<h4>Payment failed</h4><p>Network error talking to the store backend.</p>');
-        throw new Error('network_error');
+        state.ambiguousRetry = true;
+        state.ambiguousProductId = product.id;
+        setCheckoutLocked(true);
+        renderReceipt(
+          'pending',
+          '<h4>Payment status unknown</h4>' +
+            '<p>The request may have completed. Keep this checkout and press Pay again to safely reuse the same reference.</p>' +
+            `<p class="request-ref">Retry-safe checkout ${escapeHtml(state.checkoutId.slice(0, 8))}</p>`,
+        );
+        throw new Error('payment_status_unknown');
       }
       if (!data.ok) {
-        renderReceipt('err', `<h4>Payment failed</h4><p>${data.code}: ${data.message}</p>`);
+        state.ambiguousRetry = false;
+        state.ambiguousProductId = null;
+        setCheckoutLocked(false);
+        renderReceipt(
+          'err',
+          `<h4>Payment failed</h4><p>${escapeHtml(data.code)}: ${escapeHtml(data.message)}</p>` +
+            `<p class="request-ref">Request ${escapeHtml(data.requestId || 'unavailable')}</p>`,
+        );
         throw new Error('charge_failed');
       }
       const pi = data.paymentIntent;
       const b = pi.amount_breakdown;
+      state.ambiguousRetry = false;
+      state.ambiguousProductId = null;
+      setCheckoutLocked(false);
+      const paid = ['succeeded', 'captured'].includes(pi.status);
+      if (!paid) {
+        const pending = ['processing', 'authorized', 'requires_action'].includes(pi.status);
+        renderReceipt(
+          pending ? 'pending' : 'err',
+          `<h4>Payment ${pending ? 'not complete' : 'failed'}</h4>` +
+            `<p>Status: ${escapeHtml(pi.status)}. This checkout is not shown as paid.</p>` +
+            `<p class="request-ref">Intent ${escapeHtml(pi.id)}</p>`,
+        );
+        throw new Error(`payment_${pi.status}`);
+      }
       renderReceipt(
         'ok',
-        '<h4>✓ Payment ' + pi.status + '</h4>' +
+        '<h4>✓ Payment ' + escapeHtml(pi.status) + '</h4>' +
           '<dl>' +
-          `<dt>Order</dt><dd>${product.name}</dd>` +
-          `<dt>Intent</dt><dd>${pi.id}</dd>` +
-          `<dt>Entity</dt><dd>${pi.entity}</dd>` +
+          `<dt>Order</dt><dd>${escapeHtml(product.name)}</dd>` +
+          `<dt>Intent</dt><dd>${escapeHtml(pi.id)}</dd>` +
+          `<dt>Entity</dt><dd>${escapeHtml(pi.entity)}</dd>` +
           `<dt>Subtotal</dt><dd>${price(b.subtotal, b.currency)}</dd>` +
           `<dt>Tax</dt><dd>${price(b.tax, b.currency)}</dd>` +
           `<dt>Duty</dt><dd>${price(b.duty, b.currency)}</dd>` +
           `<dt>Total</dt><dd>${price(b.total, b.currency)}</dd>` +
-          '</dl>',
+          '</dl>' +
+          `<p class="request-ref">Retry-safe checkout ${escapeHtml(state.checkoutId.slice(0, 8))}</p>`,
       );
     },
-    onError: (message) => renderReceipt('err', `<h4>Payment failed</h4><p>${message}</p>`),
+    onError: (message) =>
+      renderReceipt('err', `<h4>Payment failed</h4><p>${escapeHtml(message)}</p>`),
   });
 }
 
@@ -320,6 +398,29 @@ function openCheckout() {
   overlay.classList.add('open');
   drawer.classList.add('open');
   drawer.setAttribute('aria-hidden', 'false');
+  if (state.ambiguousRetry) {
+    renderOrderSummary();
+    if (state.product.id !== state.ambiguousProductId || !state.breakdown || !state.quoteToken) {
+      renderPaymentPlaceholder('Check the previous payment in Open Border before starting another checkout.');
+      renderReceipt(
+        'pending',
+        '<h4>Previous payment status unknown</h4><p>Return to the original item or check the merchant dashboard before trying a new order.</p>',
+      );
+      return;
+    }
+    renderTotals(state.breakdown, 'Retrying the same signed quote and checkout reference.');
+    setCheckoutLocked(true);
+    mountEmbed();
+    renderReceipt(
+      'pending',
+      '<h4>Payment status unknown</h4>' +
+        '<p>Press Pay again to safely reuse the same checkout reference.</p>' +
+        `<p class="request-ref">Retry-safe checkout ${escapeHtml(state.checkoutId.slice(0, 8))}</p>`,
+    );
+    return;
+  }
+  resetCheckout();
+  setCheckoutLocked(false);
   updateDrawer();
 }
 
@@ -346,12 +447,15 @@ for (const el of document.querySelectorAll('[data-nav-home]')) el.addEventListen
 // A new ship-to country / postal code changes the duty & tax quote.
 function onAddressChange() {
   if (!drawer.classList.contains('open') || !state.product) return;
+  if (state.ambiguousRetry) return;
+  resetCheckout();
   refreshQuote().then((quoted) => {
     if (quoted && drawer.classList.contains('open') && state.product) mountEmbed();
   });
 }
 $('country').addEventListener('change', onAddressChange);
 $('postal_code').addEventListener('change', onAddressChange);
+for (const id of ['email', 'name', 'line1', 'city']) $(id).addEventListener('change', onAddressChange);
 
 $('drawer-close').addEventListener('click', closeCheckout);
 overlay.addEventListener('click', closeCheckout);
