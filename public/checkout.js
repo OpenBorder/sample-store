@@ -1,6 +1,6 @@
 // Demo catalog. Each product carries a list price per currency (integer minor units) — the
 // shopper's chosen currency is what routes the charge to an Open Border acquiring entity.
-const ENTITY = { USD: 'obmor_us', GBP: 'obmor_uk', EUR: 'obmor_nl', CAD: 'obmor_ca', AUD: 'obmor_au' };
+const ENTITY = { USD: 'obmor_us', GBP: 'obmor_uk', EUR: 'obmor_eu', CAD: 'obmor_ca', AUD: 'obmor_au' };
 const CURRENCIES = ['USD', 'GBP', 'EUR', 'CAD', 'AUD'];
 
 // Each product carries its HS (tariff) code; the server quotes duties & taxes from the code
