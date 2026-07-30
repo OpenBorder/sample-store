@@ -3,6 +3,7 @@
     { "source": "/health", "destination": "/api" },
     { "source": "/config.js", "destination": "/api" },
     { "source": "/quote", "destination": "/api" },
-    { "source": "/charge", "destination": "/api" }
+    { "source": "/charge", "destination": "/api" },
+    { "source": "/webhooks/openborder", "destination": "/api" }
   ]
 }

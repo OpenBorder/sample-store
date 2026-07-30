@@ -5,20 +5,23 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
 ## Before recording
 
 - Open the deployed sample store in a clean browser profile.
-- Confirm `/health` reports test mode.
+- Confirm `/health` reports production-Sandbox mode and whether transactions are explicitly
+  enabled. Stop if durable orders or authentic webhooks are false.
 - Use a dedicated demo buyer and non-sensitive shipping address.
-- Open the staging merchant **Transactions** page in a second tab.
+- Open the production dashboard's **Sandbox Transactions** view in a second tab.
 - Hide bookmarks, notifications, environment settings, and all secret-key screens.
 
 ## Recording flow
 
-1. **Show the outcome first.** Choose GBP and open the hoodie. Point out `GBP → obmor_uk`.
+1. **Show the outcome first.** Choose GBP and open the hoodie. Point out the United Kingdom
+   settlement region without showing an internal routing identifier.
 2. **Open checkout.** Use a UK address and show the tax, duty, and final total before payment.
-3. **Complete a test payment.** Use the standard test card. Do not show or paste any API key.
-4. **Read the receipt.** Show the succeeded status, Open Border intent ID, entity, and matching
-   subtotal/tax/duty/total.
-5. **Show monitoring.** Copy the intent ID, switch to the staging merchant dashboard, search it,
-   and confirm the transaction matches the receipt.
+3. **Complete a synthetic test payment only after provider-delivery approval.** Do not show or
+   paste any credential or provider identifier.
+4. **Read the receipt.** Show the submitted state and matching subtotal/tax/duty/total. Explain
+   that the order is not terminal until the authentic webhook is reconciled.
+5. **Show monitoring.** Switch to the production dashboard's Sandbox view and confirm the
+   aggregate transaction status without recording identifiers or customer details.
 6. **Explain the integration in one minute.** The browser uses the publishable key with
    `@open-border/js`; the backend keeps the secret key and uses `@open-border/node` for the tax
    quote and payment intent.
@@ -33,5 +36,5 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
 
 ## Final sentence
 
-“This is the same public integration a developer can clone: test-mode checkout, tax and duty,
-entity routing, safe retries, and transaction monitoring end to end.”
+“This is the same public integration a developer can clone: production-Sandbox checkout, durable
+orders, safe retries, and authentic terminal reconciliation.”

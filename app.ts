@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
+import postgres from 'postgres';
 import {
   OpenBorderApiError,
   OpenBorderClient,
@@ -8,6 +9,12 @@ import {
   type PaymentIntentResponse,
   type TaxQuoteResponse,
 } from '@open-border/node';
+import {
+  createMemoryOrderStore,
+  createPostgresOrderStore,
+  type OrderStore,
+} from './order-store';
+import { createWebhookReceiver, hashPrivateReference } from './webhook';
 
 const CATALOG = {
   hoodie: {
@@ -51,6 +58,13 @@ export interface OpenBorderGateway {
 interface AppConfig {
   publishableKey: string;
   apiBaseUrl?: string;
+  transactionsEnabled?: boolean;
+}
+
+interface AppOptions {
+  store?: OrderStore;
+  webhookSecret?: string;
+  referenceSecret?: string;
 }
 
 interface QuoteTokenPayload {
@@ -262,8 +276,19 @@ function verifyQuote(token: string, signingSecret: string, input: CheckoutInput)
   return payload;
 }
 
-export function createApp(config: AppConfig, client: OpenBorderGateway, signingSecret: string) {
+export function createApp(
+  config: AppConfig,
+  client: OpenBorderGateway,
+  signingSecret: string,
+  options: AppOptions = {},
+) {
   if (signingSecret.length < 16) throw new Error('Quote signing secret must be at least 16 characters.');
+  const transactionsEnabled = config.transactionsEnabled ?? true;
+  const store = options.store ?? createMemoryOrderStore();
+  const referenceSecret = options.referenceSecret ?? signingSecret;
+  const durableOrders = transactionsEnabled && options.store !== undefined;
+  const authenticWebhooks =
+    durableOrders && Boolean(options.webhookSecret && options.referenceSecret);
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
@@ -274,21 +299,52 @@ export function createApp(config: AppConfig, client: OpenBorderGateway, signingS
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     next();
   });
+  app.post(
+    '/webhooks/openborder',
+    express.raw({ type: 'application/json', limit: '64kb' }),
+    authenticWebhooks
+      ? createWebhookReceiver({
+          webhookSecret: options.webhookSecret!,
+          referenceSecret: options.referenceSecret!,
+          store,
+        })
+      : (_req, res) =>
+          res.status(503).json({ ok: false, code: 'demo_not_enabled' }),
+  );
   app.use(express.json({ limit: '24kb' }));
 
   const quoteLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
   const chargeLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false });
 
-  app.get('/health', (_req, res) => res.json({ ok: true, mode: 'test' }));
+  app.get('/health', async (_req, res) => {
+    const storeReady = durableOrders ? await store.checkReady().catch(() => false) : false;
+    res.json({
+      ok: true,
+      mode: 'production-sandbox',
+      transactionsEnabled,
+      durableOrders: storeReady,
+      authenticWebhooks: authenticWebhooks && storeReady,
+    });
+  });
 
   app.get('/config.js', (_req, res) => {
     res
       .setHeader('Cache-Control', 'no-store')
       .type('application/javascript')
-      .send(`window.OB_CONFIG = ${JSON.stringify(config)};`);
+      .send(
+        `window.OB_CONFIG = ${JSON.stringify({
+          publishableKey: config.publishableKey,
+          ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+          transactionsEnabled,
+        })};`,
+      );
   });
 
   app.post('/quote', quoteLimiter, async (req, res) => {
+    if (!transactionsEnabled) {
+      res.status(503).json({ ok: false, code: 'demo_not_enabled' });
+      return;
+    }
     try {
       const input = parseCheckoutInput(req.body, false);
       const product = CATALOG[input.productId];
@@ -367,9 +423,21 @@ export function createApp(config: AppConfig, client: OpenBorderGateway, signingS
   });
 
   app.post('/charge', chargeLimiter, async (req, res) => {
+    if (!transactionsEnabled) {
+      res.status(503).json({ ok: false, code: 'demo_not_enabled' });
+      return;
+    }
     try {
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
+      const order = await store.createOrGet({
+        checkoutId: input.checkoutId,
+        idempotencyKey: randomUUID(),
+        status: 'awaiting_payment',
+        productId: input.productId,
+        amount: input.amount,
+        currency: input.currency,
+      });
       const paymentInput: CreatePaymentIntentInput = {
         ...(quote.taxQuoteId ? { tax_quote_id: quote.taxQuoteId } : {}),
         amount: input.amount,
@@ -384,9 +452,17 @@ export function createApp(config: AppConfig, client: OpenBorderGateway, signingS
       };
 
       const paymentIntent = await client.createPaymentIntent(paymentInput, {
-        idempotencyKey: `sample-store:${input.checkoutId}`,
+        idempotencyKey: order.idempotencyKey,
       });
-      res.json({ ok: true, checkoutId: input.checkoutId, paymentIntent });
+      await store.attachPaymentReference(
+        input.checkoutId,
+        hashPrivateReference(referenceSecret, paymentIntent.id),
+      );
+      res.json({
+        ok: true,
+        checkoutId: input.checkoutId,
+        status: 'payment_submitted',
+      });
     } catch (error) {
       sendError(res, error);
     }
@@ -404,25 +480,57 @@ export function createApp(config: AppConfig, client: OpenBorderGateway, signingS
 }
 
 export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
+  const transactionsEnabled = env.DEMO_TRANSACTIONS_ENABLED === 'true';
+  if (!transactionsEnabled) {
+    const disabledGateway: OpenBorderGateway = {
+      createTaxQuote: async () => {
+        throw new Error('demo_not_enabled');
+      },
+      createPaymentIntent: async () => {
+        throw new Error('demo_not_enabled');
+      },
+    };
+    return createApp(
+      { publishableKey: '', transactionsEnabled: false },
+      disabledGateway,
+      'zero-cap-quote-signing-secret',
+    );
+  }
+
   const secretKey = env.OB_SECRET_KEY;
   const publishableKey = env.OB_PUBLISHABLE_KEY;
-  const apiBaseUrl = env.OB_API_URL;
+  const apiBaseUrl = env.OB_API_URL ?? 'https://api-demo.openborderpayments.com';
+  const databaseUrl = env.DATABASE_URL;
+  const webhookSecret = env.OB_WEBHOOK_SECRET;
+  const referenceSecret = env.ORDER_REFERENCE_HMAC_SECRET;
 
   if (!secretKey || !publishableKey) {
-    throw new Error('Set OB_SECRET_KEY and OB_PUBLISHABLE_KEY (see .env.example).');
+    throw new Error('Enabled transactions require Test credentials.');
   }
   if (!secretKey.startsWith('sk_test_') || !publishableKey.startsWith('pk_test_')) {
     throw new Error('This public demo accepts Open Border test keys only. Live keys are refused.');
   }
-  if (apiBaseUrl) {
-    const url = new URL(apiBaseUrl);
-    const local = ['localhost', '127.0.0.1'].includes(url.hostname);
-    const safeRemote =
-      url.protocol === 'https:' &&
-      ['api-staging.openborderpayments.com', 'api-dev.openborderpayments.com'].includes(url.hostname);
-    if (url.username || url.password || (!local && !safeRemote)) {
-      throw new Error('OB_API_URL must be localhost or an approved HTTPS Open Border staging/dev host.');
-    }
+  const url = new URL(apiBaseUrl);
+  if (
+    url.origin !== 'https://api-demo.openborderpayments.com' ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.hash ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error('OB_API_URL must target the exact production Sandbox API.');
+  }
+  if (!databaseUrl || !webhookSecret || !referenceSecret) {
+    throw new Error(
+      'Enabled transactions require durable storage and webhook prerequisites.',
+    );
+  }
+  if (!webhookSecret.startsWith('whsec_')) {
+    throw new Error('Enabled transactions require an authentic webhook signing secret.');
+  }
+  if (referenceSecret.length < 32) {
+    throw new Error('ORDER_REFERENCE_HMAC_SECRET must contain at least 32 characters.');
   }
 
   const fetchWithTimeout: typeof fetch = (input, init = {}) =>
@@ -430,12 +538,18 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
 
   const client = new OpenBorderClient({
     apiKey: secretKey,
-    ...(apiBaseUrl ? { baseUrl: apiBaseUrl } : {}),
+    baseUrl: apiBaseUrl,
     fetch: fetchWithTimeout,
   });
+  const sql = postgres(databaseUrl, { max: 1, prepare: false });
   return createApp(
-    { publishableKey, ...(apiBaseUrl ? { apiBaseUrl } : {}) },
+    { publishableKey, apiBaseUrl, transactionsEnabled: true },
     client,
-    secretKey,
+    referenceSecret,
+    {
+      store: createPostgresOrderStore(sql),
+      webhookSecret,
+      referenceSecret,
+    },
   );
 }

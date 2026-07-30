@@ -94,10 +94,11 @@ test('the displayed signed quote is charged with a stable retry key', async () =
   const first = await request(app).post('/charge').send(chargeBody).expect(200);
   const replay = await request(app).post('/charge').send(chargeBody).expect(200);
 
-  assert.equal(first.body.paymentIntent.id, 'pi_test_123');
-  assert.equal(replay.body.paymentIntent.id, 'pi_test_123');
-  assert.equal(gateway.paymentCalls[0]?.key, `sample-store:${checkoutId}`);
-  assert.equal(gateway.paymentCalls[1]?.key, `sample-store:${checkoutId}`);
+  assert.equal(first.body.status, 'payment_submitted');
+  assert.equal(replay.body.status, 'payment_submitted');
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+  assert.match(gateway.paymentCalls[0]?.key ?? '', /^[0-9a-f-]{36}$/);
+  assert.doesNotMatch(JSON.stringify(first.body), /pi_test_123|obmor_uk/);
   assert.equal(gateway.paymentCalls[0]?.input.tax_quote_id, 'tq_test_123');
   assert.equal(gateway.paymentCalls[0]?.input.amount, 3400);
   assert.equal(gateway.paymentCalls[0]?.input.line_items[0]?.hs_code, '6110.20');
@@ -180,29 +181,43 @@ test('charge attempts are rate limited for public-demo safety', async () => {
   assert.equal(limited.body.error, undefined);
 });
 
-test('public demo startup refuses live, mixed, and unsafe custom endpoints', () => {
+test('enabled public demo startup refuses live, mixed, and unsafe custom endpoints', () => {
   assert.throws(
-    () => createConfiguredApp({ OB_SECRET_KEY: 'sk_live_example', OB_PUBLISHABLE_KEY: 'pk_live_example' }),
-    /test keys only/,
-  );
-  assert.throws(
-    () => createConfiguredApp({ OB_SECRET_KEY: 'sk_test_example', OB_PUBLISHABLE_KEY: 'pk_live_example' }),
+    () =>
+      createConfiguredApp({
+        DEMO_TRANSACTIONS_ENABLED: 'true',
+        OB_SECRET_KEY: 'sk_live_example',
+        OB_PUBLISHABLE_KEY: 'pk_live_example',
+      }),
     /test keys only/,
   );
   assert.throws(
     () =>
       createConfiguredApp({
+        DEMO_TRANSACTIONS_ENABLED: 'true',
+        OB_SECRET_KEY: 'sk_test_example',
+        OB_PUBLISHABLE_KEY: 'pk_live_example',
+      }),
+    /test keys only/,
+  );
+  assert.throws(
+    () =>
+      createConfiguredApp({
+        DEMO_TRANSACTIONS_ENABLED: 'true',
         OB_SECRET_KEY: 'sk_test_example',
         OB_PUBLISHABLE_KEY: 'pk_test_example',
         OB_API_URL: 'https://api.openborderpayments.com',
       }),
-    /staging\/dev host/,
+    /exact production Sandbox API/,
   );
-  assert.doesNotThrow(() =>
-    createConfiguredApp({
-      OB_SECRET_KEY: `sk_test_${'x'.repeat(24)}`,
-      OB_PUBLISHABLE_KEY: 'pk_test_example',
-      OB_API_URL: 'https://api-staging.openborderpayments.com',
-    }),
+  assert.throws(
+    () =>
+      createConfiguredApp({
+        DEMO_TRANSACTIONS_ENABLED: 'true',
+        OB_SECRET_KEY: `sk_test_${'x'.repeat(24)}`,
+        OB_PUBLISHABLE_KEY: 'pk_test_example',
+        OB_API_URL: 'https://api-staging.openborderpayments.com',
+      }),
+    /exact production Sandbox API/,
   );
 });
