@@ -1,6 +1,6 @@
 // Demo catalog. Each product carries a list price per currency (integer minor units) — the
-// shopper's chosen currency is what routes the charge to an Open Border acquiring entity.
-const ENTITY = { USD: 'obmor_us', GBP: 'obmor_uk', EUR: 'obmor_eu', CAD: 'obmor_ca', AUD: 'obmor_au' };
+// The shopper's currency determines the settlement region without exposing internal routing IDs.
+const ROUTE = { USD: 'United States', GBP: 'United Kingdom', EUR: 'Europe', CAD: 'Canada', AUD: 'Australia' };
 const CURRENCIES = ['USD', 'GBP', 'EUR', 'CAD', 'AUD'];
 
 // Each product carries its HS (tariff) code; the server quotes duties & taxes from the code
@@ -81,7 +81,9 @@ function setCheckoutLocked(locked) {
 }
 
 
-const ob = OpenBorder(OB_CONFIG.publishableKey, { apiBaseUrl: OB_CONFIG.apiBaseUrl });
+const ob = OB_CONFIG.transactionsEnabled
+  ? OpenBorder(OB_CONFIG.publishableKey, { apiBaseUrl: OB_CONFIG.apiBaseUrl })
+  : null;
 let mounted = null; // current embed instance, so we can unmount when switching currency/product.
 
 function unmountEmbed() {
@@ -142,7 +144,7 @@ function renderPDP(product) {
   $('pdp-cat').textContent = product.cat;
   $('pdp-name').textContent = product.name;
   $('pdp-price').textContent = price(product.prices[ccy], ccy);
-  $('pdp-route').textContent = `Charged in ${ccy} → routes to ${ENTITY[ccy]}`;
+  $('pdp-route').textContent = `Charged in ${ccy} · settlement region ${ROUTE[ccy]}`;
   $('pdp-desc').textContent = product.desc;
   $('pdp-features').innerHTML = product.features.map((f) => `<li>${f}</li>`).join('');
   $('pdp-ccy').value = ccy;
@@ -218,7 +220,7 @@ function renderOrderSummary() {
   thumb.innerHTML = `<span class="summary-thumb-object" aria-hidden="true">${product.emoji}</span>`;
   thumb.style.background = `linear-gradient(135deg, ${product.grad[0]}, ${product.grad[1]})`;
   $('sum-name').textContent = product.name;
-  $('sum-meta').textContent = `${ccy} → ${ENTITY[ccy]}`;
+  $('sum-meta').textContent = `${ccy} · ${ROUTE[ccy]}`;
   $('sum-price').textContent = price(amount, ccy);
   receiptCard.hidden = true;
 }
@@ -284,6 +286,12 @@ function mountEmbed() {
   const ccy = state.currency;
   const amount = product.prices[ccy];
 
+  if (!ob) {
+    renderPaymentPlaceholder(
+      'Sandbox checkout is paused until durable orders and authentic webhooks are approved and configured.',
+    );
+    return;
+  }
   if (!state.breakdown || !state.quoteToken) {
     renderPaymentPlaceholder('Payment is unavailable until duties & taxes can be quoted.');
     return;
@@ -352,29 +360,16 @@ function mountEmbed() {
         );
         throw new Error('charge_failed');
       }
-      const pi = data.paymentIntent;
-      const b = pi.amount_breakdown;
       state.ambiguousRetry = false;
       state.ambiguousProductId = null;
       setCheckoutLocked(false);
-      const paid = ['succeeded', 'captured'].includes(pi.status);
-      if (!paid) {
-        const pending = ['processing', 'authorized', 'requires_action'].includes(pi.status);
-        renderReceipt(
-          pending ? 'pending' : 'err',
-          `<h4>Payment ${pending ? 'not complete' : 'failed'}</h4>` +
-            `<p>Status: ${escapeHtml(pi.status)}. This checkout is not shown as paid.</p>` +
-            `<p class="request-ref">Intent ${escapeHtml(pi.id)}</p>`,
-        );
-        throw new Error(`payment_${pi.status}`);
-      }
+      const b = state.breakdown;
       renderReceipt(
-        'ok',
-        '<h4>✓ Payment ' + escapeHtml(pi.status) + '</h4>' +
+        'pending',
+        '<h4>Payment submitted</h4>' +
+          '<p>The order remains pending until an authentic terminal webhook is reconciled.</p>' +
           '<dl>' +
           `<dt>Order</dt><dd>${escapeHtml(product.name)}</dd>` +
-          `<dt>Intent</dt><dd>${escapeHtml(pi.id)}</dd>` +
-          `<dt>Entity</dt><dd>${escapeHtml(pi.entity)}</dd>` +
           `<dt>Subtotal</dt><dd>${price(b.subtotal, b.currency)}</dd>` +
           `<dt>Tax</dt><dd>${price(b.tax, b.currency)}</dd>` +
           `<dt>Duty</dt><dd>${price(b.duty, b.currency)}</dd>` +
