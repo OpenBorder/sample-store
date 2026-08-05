@@ -38,14 +38,16 @@ Browser (public pk_)                         Backend (secret sk_)
 - **Retry-safe payment creation.** One checkout gets one stable reference and idempotency key.
   The order and key are persisted before the payment request, so a lost browser response can be
   replayed without creating a second payment intent.
-- **Authentic terminal reconciliation.** Raw signed webhooks are timestamp-checked, replay-safe,
-  durably deduplicated, and projected onto the persisted order. External delivery and payment
-  references are stored only as keyed hashes.
+- **Authentic Test-only terminal reconciliation.** Raw signed webhooks are timestamp-checked,
+  replay-safe, durably deduplicated, and projected onto the persisted order only when the signed
+  event declares Test mode. External delivery and payment references are stored only as keyed
+  hashes.
 - **Displayed-total integrity.** The server signs the exact quote shown in the payment element.
   The charge must use that same unexpired quote; changed or tampered checkout data is rejected.
-- **Safe public-demo behavior.** The hosted runtime starts at zero transaction capacity, accepts
-  the five catalog products only, applies a best-effort per-instance throttle, sanitizes upstream
-  errors, and refuses live keys or any API host except the production-dashboard Sandbox rail.
+- **Safe public-demo behavior.** The hosted runtime starts at a lifetime cap of zero, accepts only
+  cap `0` or `1`, admits under a database transaction so concurrent requests cannot widen the cap,
+  and refuses Live keys or any API host except the production-dashboard Sandbox rail. It also
+  validates the five catalog products, throttles per instance, and sanitizes upstream errors.
 
 This is a reference demo, not a production commerce application. It deliberately omits accounts,
 fulfilment, inventory, and live payments.
@@ -84,9 +86,10 @@ npm test
 npm run check:secrets
 ```
 
-The tests cover catalog tampering, signed displayed quotes, same-key retries, changed-request
-rejection, provider-safe errors, malformed JSON, the local throttle, and live-key refusal. CI also
-runs the repository secret scanner on every tracked and untracked source file.
+The tests cover catalog tampering, signed displayed quotes, same-key retries, atomic lifetime-cap
+admission, cap-zero readiness, signed Test-only reconciliation, changed-request rejection,
+provider-safe errors, malformed JSON, the local throttle, and Live-key refusal. CI also runs the
+repository secret scanner on every tracked and untracked source file.
 
 For a sustained public deployment, add a platform-level rate-limit rule for `/quote` and
 `/charge`. An in-process limiter resets with serverless instances and is only a local safety net.
@@ -110,13 +113,14 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 2. Apply `migrations/001_durable_orders.sql` to an owned durable Postgres database.
 3. Configure the Test credential pair, exact Sandbox API host, webhook signing secret, database
    connection, and private-reference HMAC secret in the hosting platform.
-4. Leave `DEMO_TRANSACTIONS_ENABLED=false` until credential provisioning and provider delivery
-   have each received their own explicit approval.
+4. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning and provider delivery have each
+   received their own explicit approval.
 5. Deploy and verify `/health`.
 
 The hosted runtime accepts Test keys only and pins `OB_API_URL` to
-`https://api-demo.openborderpayments.com`. With the default zero-cap setting, `/health` reports
-that transactions, durable orders, and authentic webhooks are disabled.
+`https://api-sandbox.openborderpayments.com`. With `DEMO_TRANSACTION_CAP=0`, transaction routes
+remain closed while `/health` can independently prove durable-order and authentic-webhook
+readiness. Without those prerequisites it reports both readiness checks false.
 
 ### Enable Apple Pay / Google Pay
 

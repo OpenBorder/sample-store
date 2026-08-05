@@ -58,7 +58,7 @@ export interface OpenBorderGateway {
 interface AppConfig {
   publishableKey: string;
   apiBaseUrl?: string;
-  transactionsEnabled?: boolean;
+  transactionCap: 0 | 1;
 }
 
 interface AppOptions {
@@ -283,10 +283,11 @@ export function createApp(
   options: AppOptions = {},
 ) {
   if (signingSecret.length < 16) throw new Error('Quote signing secret must be at least 16 characters.');
-  const transactionsEnabled = config.transactionsEnabled ?? true;
+  const transactionCap = config.transactionCap;
+  const transactionsEnabled = transactionCap === 1;
   const store = options.store ?? createMemoryOrderStore();
   const referenceSecret = options.referenceSecret ?? signingSecret;
-  const durableOrders = transactionsEnabled && options.store !== undefined;
+  const durableOrders = options.store !== undefined;
   const authenticWebhooks =
     durableOrders && Boolean(options.webhookSecret && options.referenceSecret);
   const app = express();
@@ -430,14 +431,23 @@ export function createApp(
     try {
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
-      const order = await store.createOrGet({
+      const order = await store.createOrGetWithinCap({
         checkoutId: input.checkoutId,
         idempotencyKey: randomUUID(),
         status: 'awaiting_payment',
         productId: input.productId,
         amount: input.amount,
         currency: input.currency,
-      });
+      }, transactionCap);
+      if (order === 'cap_reached') {
+        res.status(503).json({
+          ok: false,
+          code: 'transaction_cap_reached',
+          message: 'The approved demo transaction has already been used.',
+          requestId: res.locals.requestId,
+        });
+        return;
+      }
       const paymentInput: CreatePaymentIntentInput = {
         ...(quote.taxQuoteId ? { tax_quote_id: quote.taxQuoteId } : {}),
         amount: input.amount,
@@ -480,8 +490,18 @@ export function createApp(
 }
 
 export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
-  const transactionsEnabled = env.DEMO_TRANSACTIONS_ENABLED === 'true';
-  if (!transactionsEnabled) {
+  const transactionCap = readTransactionCap(env.DEMO_TRANSACTION_CAP);
+  const secretKey = env.OB_SECRET_KEY;
+  const publishableKey = env.OB_PUBLISHABLE_KEY;
+  const apiBaseUrl = env.OB_API_URL ?? 'https://api-sandbox.openborderpayments.com';
+  const databaseUrl = env.DATABASE_URL;
+  const webhookSecret = env.OB_WEBHOOK_SECRET;
+  const referenceSecret = env.ORDER_REFERENCE_HMAC_SECRET;
+  const readinessPrerequisitesPresent = Boolean(
+    secretKey && publishableKey && databaseUrl && webhookSecret && referenceSecret,
+  );
+
+  if (transactionCap === 0 && !readinessPrerequisitesPresent) {
     const disabledGateway: OpenBorderGateway = {
       createTaxQuote: async () => {
         throw new Error('demo_not_enabled');
@@ -491,28 +511,21 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
       },
     };
     return createApp(
-      { publishableKey: '', transactionsEnabled: false },
+      { publishableKey: '', transactionCap: 0 },
       disabledGateway,
       'zero-cap-quote-signing-secret',
     );
   }
 
-  const secretKey = env.OB_SECRET_KEY;
-  const publishableKey = env.OB_PUBLISHABLE_KEY;
-  const apiBaseUrl = env.OB_API_URL ?? 'https://api-demo.openborderpayments.com';
-  const databaseUrl = env.DATABASE_URL;
-  const webhookSecret = env.OB_WEBHOOK_SECRET;
-  const referenceSecret = env.ORDER_REFERENCE_HMAC_SECRET;
-
   if (!secretKey || !publishableKey) {
-    throw new Error('Enabled transactions require Test credentials.');
+    throw new Error('Configured demo readiness requires Test credentials.');
   }
   if (!secretKey.startsWith('sk_test_') || !publishableKey.startsWith('pk_test_')) {
     throw new Error('This public demo accepts Open Border test keys only. Live keys are refused.');
   }
   const url = new URL(apiBaseUrl);
   if (
-    url.origin !== 'https://api-demo.openborderpayments.com' ||
+    url.origin !== 'https://api-sandbox.openborderpayments.com' ||
     url.pathname !== '/' ||
     url.search ||
     url.hash ||
@@ -523,11 +536,11 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
   }
   if (!databaseUrl || !webhookSecret || !referenceSecret) {
     throw new Error(
-      'Enabled transactions require durable storage and webhook prerequisites.',
+      'Configured demo readiness requires durable storage and webhook prerequisites.',
     );
   }
   if (!webhookSecret.startsWith('whsec_')) {
-    throw new Error('Enabled transactions require an authentic webhook signing secret.');
+    throw new Error('Configured demo readiness requires an authentic webhook signing secret.');
   }
   if (referenceSecret.length < 32) {
     throw new Error('ORDER_REFERENCE_HMAC_SECRET must contain at least 32 characters.');
@@ -543,7 +556,7 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
   });
   const sql = postgres(databaseUrl, { max: 1, prepare: false });
   return createApp(
-    { publishableKey, apiBaseUrl, transactionsEnabled: true },
+    { publishableKey, apiBaseUrl, transactionCap },
     client,
     referenceSecret,
     {
@@ -552,4 +565,11 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
       referenceSecret,
     },
   );
+}
+
+function readTransactionCap(value: string | undefined): 0 | 1 {
+  const raw = value?.trim();
+  if (!raw || raw === '0') return 0;
+  if (raw === '1') return 1;
+  throw new Error('DEMO_TRANSACTION_CAP must be 0 or 1.');
 }

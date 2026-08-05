@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import request from 'supertest';
 import { OpenBorderApiError, type PaymentIntentResponse, type TaxQuoteResponse } from '@open-border/node';
 import { createApp, createConfiguredApp, type OpenBorderGateway } from '../app';
+import { createMemoryOrderStore } from '../order-store';
 
 const checkoutId = '018f4f31-86d4-7b2e-b6bd-7f53f5f98c71';
 const baseInput = {
@@ -58,12 +59,16 @@ class FakeGateway implements OpenBorderGateway {
 }
 
 const createTestApp = (gateway = new FakeGateway()) => ({
-  app: createApp({ publishableKey: 'pk_test_public_example' }, gateway, 'unit-test-signing-secret'),
+  app: createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 1 },
+    gateway,
+    'unit-test-signing-secret',
+  ),
   gateway,
 });
 
-async function getQuoteToken(app: ReturnType<typeof createApp>) {
-  const response = await request(app).post('/quote').send(baseInput).expect(200);
+async function getQuoteToken(app: ReturnType<typeof createApp>, input = baseInput) {
+  const response = await request(app).post('/quote').send(input).expect(200);
   assert.equal(response.body.ok, true);
   assert.equal(response.body.amount_breakdown.total, 4250);
   assert.equal(typeof response.body.quoteToken, 'string');
@@ -103,6 +108,67 @@ test('the displayed signed quote is charged with a stable retry key', async () =
   assert.equal(gateway.paymentCalls[0]?.input.amount, 3400);
   assert.equal(gateway.paymentCalls[0]?.input.line_items[0]?.hs_code, '6110.20');
   assert.equal(gateway.paymentCalls[0]?.input.merchant_reference, `sample-store-${checkoutId}`);
+});
+
+test('a lifetime cap of one admits one checkout and refuses another before payment', async () => {
+  const gateway = new FakeGateway();
+  const store = createMemoryOrderStore();
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 1 },
+    gateway,
+    'unit-test-signing-secret',
+    {
+      store,
+      referenceSecret: 'private-reference-secret-for-tests',
+      webhookSecret: 'whsec_test_receiver',
+    },
+  );
+  const secondInput = {
+    ...baseInput,
+    checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72',
+  };
+  const firstQuote = await getQuoteToken(app, baseInput);
+  const secondQuote = await getQuoteToken(app, secondInput);
+
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken: firstQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+  const capped = await request(app)
+    .post('/charge')
+    .send({ ...secondInput, quoteToken: secondQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(503);
+
+  assert.equal(capped.body.code, 'transaction_cap_reached');
+  assert.equal(gateway.paymentCalls.length, 1);
+  assert.equal(await store.getByCheckoutId(secondInput.checkoutId), undefined);
+});
+
+test('concurrent distinct charges cannot exceed the lifetime cap', async () => {
+  const gateway = new FakeGateway();
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 1 },
+    gateway,
+    'unit-test-signing-secret',
+  );
+  const inputs = ['71', '72', '73', '74'].map((suffix) => ({
+    ...baseInput,
+    checkoutId: `018f4f31-86d4-7b2e-b6bd-7f53f5f98c${suffix}`,
+  }));
+  const tokens = await Promise.all(inputs.map((input) => getQuoteToken(app, input)));
+  const responses = await Promise.all(
+    inputs.map((input, index) =>
+      request(app)
+        .post('/charge')
+        .send({ ...input, quoteToken: tokens[index], paymentMethodId: 'pm_test_4242' }),
+    ),
+  );
+
+  assert.deepEqual(
+    responses.map((response) => response.status).sort(),
+    [200, 503, 503, 503],
+  );
+  assert.equal(gateway.paymentCalls.length, 1);
 });
 
 test('a changed request cannot reuse a signed displayed quote', async () => {
@@ -181,11 +247,33 @@ test('charge attempts are rate limited for public-demo safety', async () => {
   assert.equal(limited.body.error, undefined);
 });
 
-test('enabled public demo startup refuses live, mixed, and unsafe custom endpoints', () => {
+test('transaction cap defaults closed and accepts only zero or one', async () => {
+  const disabled = createConfiguredApp({ VERCEL_ENV: 'production' });
+  assert.equal((await request(disabled).get('/health').expect(200)).body.transactionsEnabled, false);
+
+  for (const value of ['2', '10', '-1', '1.0', '01', 'true', '9007199254740993']) {
+    assert.throws(
+      () => createConfiguredApp({ VERCEL_ENV: 'production', DEMO_TRANSACTION_CAP: value }),
+      /DEMO_TRANSACTION_CAP must be 0 or 1/,
+    );
+  }
+});
+
+test('capped public demo startup refuses live, mixed, and unsafe custom endpoints', () => {
   assert.throws(
     () =>
       createConfiguredApp({
-        DEMO_TRANSACTIONS_ENABLED: 'true',
+        DEMO_TRANSACTION_CAP: '1',
+        OB_SECRET_KEY: 'sk_test_example',
+        OB_PUBLISHABLE_KEY: 'pk_test_example',
+        OB_API_URL: 'https://api-demo.openborderpayments.com',
+      }),
+    /exact production Sandbox API/,
+  );
+  assert.throws(
+    () =>
+      createConfiguredApp({
+        DEMO_TRANSACTION_CAP: '1',
         OB_SECRET_KEY: 'sk_live_example',
         OB_PUBLISHABLE_KEY: 'pk_live_example',
       }),
@@ -194,7 +282,7 @@ test('enabled public demo startup refuses live, mixed, and unsafe custom endpoin
   assert.throws(
     () =>
       createConfiguredApp({
-        DEMO_TRANSACTIONS_ENABLED: 'true',
+        DEMO_TRANSACTION_CAP: '1',
         OB_SECRET_KEY: 'sk_test_example',
         OB_PUBLISHABLE_KEY: 'pk_live_example',
       }),
@@ -203,7 +291,7 @@ test('enabled public demo startup refuses live, mixed, and unsafe custom endpoin
   assert.throws(
     () =>
       createConfiguredApp({
-        DEMO_TRANSACTIONS_ENABLED: 'true',
+        DEMO_TRANSACTION_CAP: '1',
         OB_SECRET_KEY: 'sk_test_example',
         OB_PUBLISHABLE_KEY: 'pk_test_example',
         OB_API_URL: 'https://api.openborderpayments.com',
@@ -213,7 +301,7 @@ test('enabled public demo startup refuses live, mixed, and unsafe custom endpoin
   assert.throws(
     () =>
       createConfiguredApp({
-        DEMO_TRANSACTIONS_ENABLED: 'true',
+        DEMO_TRANSACTION_CAP: '1',
         OB_SECRET_KEY: `sk_test_${'x'.repeat(24)}`,
         OB_PUBLISHABLE_KEY: 'pk_test_example',
         OB_API_URL: 'https://api-staging.openborderpayments.com',

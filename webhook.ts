@@ -95,8 +95,10 @@ function readTerminalEvent(rawBody: Buffer): {
   try {
     const event = JSON.parse(rawBody.toString('utf8')) as {
       type?: unknown;
+      mode?: unknown;
       data?: { paymentIntentId?: unknown };
     };
+    if (event.mode !== 'test') return null;
     const paymentIntentId = event.data?.paymentIntentId;
     if (typeof paymentIntentId !== 'string' || !paymentIntentId) return null;
     if (
