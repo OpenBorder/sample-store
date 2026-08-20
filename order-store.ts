@@ -15,9 +15,15 @@ export interface StoredOrder {
   readonly currency: string;
 }
 
+/** Serializes the lifetime cap check against concurrent order creation. */
+const TRANSACTION_CAP_LOCK_KEY = 194_837_201;
+
 export interface OrderStore {
   checkReady(): Promise<boolean>;
-  createOrGet(order: StoredOrder): Promise<StoredOrder>;
+  createOrGetWithinCap(
+    order: StoredOrder,
+    transactionCap: 0 | 1,
+  ): Promise<StoredOrder | 'cap_reached'>;
   getByCheckoutId(checkoutId: string): Promise<StoredOrder | undefined>;
   attachPaymentReference(checkoutId: string, paymentReferenceHash: string): Promise<void>;
   applyWebhook(input: {
@@ -38,12 +44,13 @@ export function createMemoryOrderStore(
 
   return {
     checkReady: async () => true,
-    createOrGet: async (order) => {
+    createOrGetWithinCap: async (order, transactionCap) => {
       const existing = orders.get(order.checkoutId);
       if (existing) {
         assertSameOrder(existing, order);
         return existing;
       }
+      if (orders.size >= transactionCap) return 'cap_reached';
       orders.set(order.checkoutId, { ...order });
       options.onWrite?.();
       return order;
@@ -87,31 +94,49 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
       `;
       return Boolean(rows[0]?.orders && rows[0]?.deliveries);
     },
-    createOrGet: async (order) => {
-      await sql`
-        INSERT INTO sample_store_orders (
-          checkout_id,
-          idempotency_key,
-          status,
-          product_id,
-          amount,
-          currency
-        )
-        VALUES (
-          ${order.checkoutId},
-          ${order.idempotencyKey},
-          ${order.status},
-          ${order.productId},
-          ${order.amount},
-          ${order.currency}
-        )
-        ON CONFLICT (checkout_id) DO NOTHING
-      `;
-      const existing = await getOrder(sql, order.checkoutId);
-      if (!existing) throw new Error('order_persistence_failed');
-      assertSameOrder(existing, order);
-      return existing;
-    },
+    createOrGetWithinCap: async (order, transactionCap) =>
+      sql.begin(async (transaction) => {
+        await transaction`SELECT pg_advisory_xact_lock(${TRANSACTION_CAP_LOCK_KEY})`;
+        const existingRows = await transaction<StoredOrder[]>`
+          SELECT
+            checkout_id AS "checkoutId",
+            idempotency_key AS "idempotencyKey",
+            status,
+            product_id AS "productId",
+            amount,
+            currency
+          FROM sample_store_orders
+          WHERE checkout_id = ${order.checkoutId}
+        `;
+        const existing = existingRows[0];
+        if (existing) {
+          assertSameOrder(existing, order);
+          return existing;
+        }
+        const [counted] = await transaction<{ count: number }[]>`
+          SELECT count(*)::int AS count FROM sample_store_orders
+        `;
+        if ((counted?.count ?? 0) >= transactionCap) return 'cap_reached' as const;
+        await transaction`
+          INSERT INTO sample_store_orders (
+            checkout_id,
+            idempotency_key,
+            status,
+            product_id,
+            amount,
+            currency
+          )
+          VALUES (
+            ${order.checkoutId},
+            ${order.idempotencyKey},
+            ${order.status},
+            ${order.productId},
+            ${order.amount},
+            ${order.currency}
+          )
+        `;
+        return order;
+      }),
     getByCheckoutId: (checkoutId) => getOrder(sql, checkoutId),
     attachPaymentReference: async (checkoutId, paymentReferenceHash) => {
       const rows = await sql`

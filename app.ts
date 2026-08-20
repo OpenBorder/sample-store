@@ -5,6 +5,7 @@ import postgres from 'postgres';
 import {
   OpenBorderApiError,
   OpenBorderClient,
+  type CheckoutConfigResponse,
   type CreatePaymentIntentInput,
   type PaymentIntentResponse,
   type TaxQuoteResponse,
@@ -48,6 +49,9 @@ type ProductId = keyof typeof CATALOG;
 type Currency = keyof (typeof CATALOG)['hoodie']['prices'];
 
 export interface OpenBorderGateway {
+  getCheckoutConfig(
+    input: Parameters<OpenBorderClient['getCheckoutConfig']>[0],
+  ): Promise<CheckoutConfigResponse>;
   createTaxQuote(input: Parameters<OpenBorderClient['createTaxQuote']>[0]): Promise<TaxQuoteResponse>;
   createPaymentIntent(
     input: CreatePaymentIntentInput,
@@ -58,7 +62,7 @@ export interface OpenBorderGateway {
 interface AppConfig {
   publishableKey: string;
   apiBaseUrl?: string;
-  transactionsEnabled?: boolean;
+  transactionCap: 0 | 1;
 }
 
 interface AppOptions {
@@ -67,6 +71,10 @@ interface AppOptions {
   referenceSecret?: string;
 }
 
+type ProvenanceCheckoutConfigResponse = CheckoutConfigResponse & {
+  readonly demo_store?: unknown;
+};
+
 interface QuoteTokenPayload {
   v: 1;
   checkoutId: string;
@@ -74,7 +82,7 @@ interface QuoteTokenPayload {
   currency: Currency;
   amount: number;
   total: number;
-  taxQuoteId: string | null;
+  taxQuoteId: string;
   normalizedHsCode: string;
   buyerFingerprint: string;
   expiresAt: number;
@@ -219,6 +227,27 @@ const providerMessage = (code: string) => {
   return 'Open Border could not complete this test request. Please try again.';
 };
 
+async function hasTrustedCustomApiProvenance(
+  client: OpenBorderGateway,
+  currency: Currency,
+): Promise<boolean> {
+  try {
+    const config = await client.getCheckoutConfig({ currency });
+    return (config as ProvenanceCheckoutConfigResponse).demo_store === 'custom_api';
+  } catch {
+    return false;
+  }
+}
+
+function sendDemoProvenanceUnavailable(res: Response): void {
+  res.status(503).json({
+    ok: false,
+    code: 'demo_provenance_unavailable',
+    message: 'The verified Custom API Sandbox provenance is unavailable.',
+    requestId: res.locals.requestId,
+  });
+}
+
 function sendError(res: Response, error: unknown) {
   const requestId = res.locals.requestId as string | undefined;
   if (error instanceof RequestValidationError) {
@@ -269,6 +298,8 @@ function verifyQuote(token: string, signingSecret: string, input: CheckoutInput)
     payload.amount !== input.amount ||
     payload.buyerFingerprint !== buyerFingerprintFor(input) ||
     payload.expiresAt <= Date.now() ||
+    typeof payload.taxQuoteId !== 'string' ||
+    payload.taxQuoteId.length === 0 ||
     !/^\d{4}\.\d{2,4}$/.test(payload.normalizedHsCode)
   ) {
     throw new RequestValidationError({ quoteToken: 'The displayed quote expired or no longer matches this checkout.' });
@@ -283,10 +314,11 @@ export function createApp(
   options: AppOptions = {},
 ) {
   if (signingSecret.length < 16) throw new Error('Quote signing secret must be at least 16 characters.');
-  const transactionsEnabled = config.transactionsEnabled ?? true;
+  const transactionCap = config.transactionCap;
+  const transactionsEnabled = transactionCap === 1;
   const store = options.store ?? createMemoryOrderStore();
   const referenceSecret = options.referenceSecret ?? signingSecret;
-  const durableOrders = transactionsEnabled && options.store !== undefined;
+  const durableOrders = options.store !== undefined;
   const authenticWebhooks =
     durableOrders && Boolean(options.webhookSecret && options.referenceSecret);
   const app = express();
@@ -317,13 +349,17 @@ export function createApp(
   const chargeLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false });
 
   app.get('/health', async (_req, res) => {
-    const storeReady = durableOrders ? await store.checkReady().catch(() => false) : false;
+    const [storeReady, trustedDemoProvenance] = await Promise.all([
+      durableOrders ? store.checkReady().catch(() => false) : false,
+      hasTrustedCustomApiProvenance(client, 'USD'),
+    ]);
     res.json({
       ok: true,
       mode: 'production-sandbox',
       transactionsEnabled,
       durableOrders: storeReady,
       authenticWebhooks: authenticWebhooks && storeReady,
+      trustedDemoProvenance,
     });
   });
 
@@ -348,75 +384,43 @@ export function createApp(
     try {
       const input = parseCheckoutInput(req.body, false);
       const product = CATALOG[input.productId];
-      try {
-        const quote = await client.createTaxQuote({
-          destination_country: input.address.country,
-          ...(input.address.postal_code ? { destination_postal_code: input.address.postal_code } : {}),
-          currency: input.currency,
-          line_items: lineItemsFor(input, product.hsCode),
-          ...(input.email ? { customer: { email: input.email } } : {}),
-        });
-        const parsedExpiry = Date.parse(quote.expires_at);
-        const expiresAt = Number.isFinite(parsedExpiry)
-          ? Math.min(parsedExpiry, Date.now() + 15 * 60_000)
-          : Date.now() + 15 * 60_000;
-        res.json({
-          ok: true,
-          domestic: false,
-          taxQuoteId: quote.id,
-          normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
-          quoteToken: signQuote(
-            {
-              v: 1,
-              checkoutId: input.checkoutId,
-              productId: input.productId,
-              currency: input.currency,
-              amount: input.amount,
-              total: quote.amount_breakdown.total,
-              taxQuoteId: quote.id,
-              normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
-              buyerFingerprint: buyerFingerprintFor(input),
-              expiresAt,
-            },
-            signingSecret,
-          ),
-          amount_breakdown: quote.amount_breakdown,
-        });
-      } catch (error) {
-        if (error instanceof OpenBorderApiError && error.code === 'domestic_not_supported') {
-          res.json({
-            ok: true,
-            domestic: true,
-            taxQuoteId: null,
-            normalizedHsCode: product.hsCode,
-            quoteToken: signQuote(
-              {
-                v: 1,
-                checkoutId: input.checkoutId,
-                productId: input.productId,
-                currency: input.currency,
-                amount: input.amount,
-                total: input.amount,
-                taxQuoteId: null,
-                normalizedHsCode: product.hsCode,
-                buyerFingerprint: buyerFingerprintFor(input),
-                expiresAt: Date.now() + 15 * 60_000,
-              },
-              signingSecret,
-            ),
-            amount_breakdown: {
-              subtotal: input.amount,
-              shipping: 0,
-              tax: 0,
-              duty: 0,
-              total: input.amount,
-              currency: input.currency,
-            },
-          });
-          return;
-        }
-        throw error;
+      if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
+        sendDemoProvenanceUnavailable(res);
+        return;
       }
+      const quote = await client.createTaxQuote({
+        destination_country: input.address.country,
+        ship_from_country: 'US',
+        currency: input.currency,
+        line_items: lineItemsFor(input, product.hsCode),
+        ...(input.email ? { customer: { email: input.email } } : {}),
+      });
+      const parsedExpiry = Date.parse(quote.expires_at);
+      const expiresAt = Number.isFinite(parsedExpiry)
+        ? Math.min(parsedExpiry, Date.now() + 15 * 60_000)
+        : Date.now() + 15 * 60_000;
+      res.json({
+        ok: true,
+        domestic: input.address.country === 'US',
+        taxQuoteId: quote.id,
+        normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
+        quoteToken: signQuote(
+          {
+            v: 1,
+            checkoutId: input.checkoutId,
+            productId: input.productId,
+            currency: input.currency,
+            amount: input.amount,
+            total: quote.amount_breakdown.total,
+            taxQuoteId: quote.id,
+            normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
+            buyerFingerprint: buyerFingerprintFor(input),
+            expiresAt,
+          },
+          signingSecret,
+        ),
+        amount_breakdown: quote.amount_breakdown,
+      });
     } catch (error) {
       sendError(res, error);
     }
@@ -430,16 +434,29 @@ export function createApp(
     try {
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
-      const order = await store.createOrGet({
+      if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
+        sendDemoProvenanceUnavailable(res);
+        return;
+      }
+      const order = await store.createOrGetWithinCap({
         checkoutId: input.checkoutId,
         idempotencyKey: randomUUID(),
         status: 'awaiting_payment',
         productId: input.productId,
         amount: input.amount,
         currency: input.currency,
-      });
+      }, transactionCap);
+      if (order === 'cap_reached') {
+        res.status(503).json({
+          ok: false,
+          code: 'transaction_cap_reached',
+          message: 'The approved demo transaction has already been used.',
+          requestId: res.locals.requestId,
+        });
+        return;
+      }
       const paymentInput: CreatePaymentIntentInput = {
-        ...(quote.taxQuoteId ? { tax_quote_id: quote.taxQuoteId } : {}),
+        tax_quote_id: quote.taxQuoteId,
         amount: input.amount,
         currency: input.currency,
         payment_method: input.paymentMethodId,
@@ -480,9 +497,22 @@ export function createApp(
 }
 
 export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
-  const transactionsEnabled = env.DEMO_TRANSACTIONS_ENABLED === 'true';
-  if (!transactionsEnabled) {
+  const transactionCap = readTransactionCap(env.DEMO_TRANSACTION_CAP);
+  const secretKey = env.OB_SECRET_KEY;
+  const publishableKey = env.OB_PUBLISHABLE_KEY;
+  const apiBaseUrl = env.OB_API_URL ?? 'https://api-sandbox.openborderpayments.com';
+  const databaseUrl = env.DATABASE_URL;
+  const webhookSecret = env.OB_WEBHOOK_SECRET;
+  const referenceSecret = env.ORDER_REFERENCE_HMAC_SECRET;
+  const readinessPrerequisitesPresent = Boolean(
+    secretKey && publishableKey && databaseUrl && webhookSecret && referenceSecret,
+  );
+
+  if (transactionCap === 0 && !readinessPrerequisitesPresent) {
     const disabledGateway: OpenBorderGateway = {
+      getCheckoutConfig: async () => {
+        throw new Error('demo_not_enabled');
+      },
       createTaxQuote: async () => {
         throw new Error('demo_not_enabled');
       },
@@ -491,28 +521,21 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
       },
     };
     return createApp(
-      { publishableKey: '', transactionsEnabled: false },
+      { publishableKey: '', transactionCap: 0 },
       disabledGateway,
       'zero-cap-quote-signing-secret',
     );
   }
 
-  const secretKey = env.OB_SECRET_KEY;
-  const publishableKey = env.OB_PUBLISHABLE_KEY;
-  const apiBaseUrl = env.OB_API_URL ?? 'https://api-demo.openborderpayments.com';
-  const databaseUrl = env.DATABASE_URL;
-  const webhookSecret = env.OB_WEBHOOK_SECRET;
-  const referenceSecret = env.ORDER_REFERENCE_HMAC_SECRET;
-
   if (!secretKey || !publishableKey) {
-    throw new Error('Enabled transactions require Test credentials.');
+    throw new Error('Configured demo readiness requires Test credentials.');
   }
   if (!secretKey.startsWith('sk_test_') || !publishableKey.startsWith('pk_test_')) {
     throw new Error('This public demo accepts Open Border test keys only. Live keys are refused.');
   }
   const url = new URL(apiBaseUrl);
   if (
-    url.origin !== 'https://api-demo.openborderpayments.com' ||
+    url.origin !== 'https://api-sandbox.openborderpayments.com' ||
     url.pathname !== '/' ||
     url.search ||
     url.hash ||
@@ -523,11 +546,11 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
   }
   if (!databaseUrl || !webhookSecret || !referenceSecret) {
     throw new Error(
-      'Enabled transactions require durable storage and webhook prerequisites.',
+      'Configured demo readiness requires durable storage and webhook prerequisites.',
     );
   }
   if (!webhookSecret.startsWith('whsec_')) {
-    throw new Error('Enabled transactions require an authentic webhook signing secret.');
+    throw new Error('Configured demo readiness requires an authentic webhook signing secret.');
   }
   if (referenceSecret.length < 32) {
     throw new Error('ORDER_REFERENCE_HMAC_SECRET must contain at least 32 characters.');
@@ -543,7 +566,7 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
   });
   const sql = postgres(databaseUrl, { max: 1, prepare: false });
   return createApp(
-    { publishableKey, apiBaseUrl, transactionsEnabled: true },
+    { publishableKey, apiBaseUrl, transactionCap },
     client,
     referenceSecret,
     {
@@ -552,4 +575,11 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
       referenceSecret,
     },
   );
+}
+
+function readTransactionCap(value: string | undefined): 0 | 1 {
+  const raw = value?.trim();
+  if (!raw || raw === '0') return 0;
+  if (raw === '1') return 1;
+  throw new Error('DEMO_TRANSACTION_CAP must be 0 or 1.');
 }
