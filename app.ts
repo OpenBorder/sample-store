@@ -5,6 +5,7 @@ import postgres from 'postgres';
 import {
   OpenBorderApiError,
   OpenBorderClient,
+  type CheckoutConfigResponse,
   type CreatePaymentIntentInput,
   type PaymentIntentResponse,
   type TaxQuoteResponse,
@@ -48,6 +49,9 @@ type ProductId = keyof typeof CATALOG;
 type Currency = keyof (typeof CATALOG)['hoodie']['prices'];
 
 export interface OpenBorderGateway {
+  getCheckoutConfig(
+    input: Parameters<OpenBorderClient['getCheckoutConfig']>[0],
+  ): Promise<CheckoutConfigResponse>;
   createTaxQuote(input: Parameters<OpenBorderClient['createTaxQuote']>[0]): Promise<TaxQuoteResponse>;
   createPaymentIntent(
     input: CreatePaymentIntentInput,
@@ -67,6 +71,10 @@ interface AppOptions {
   referenceSecret?: string;
 }
 
+type ProvenanceCheckoutConfigResponse = CheckoutConfigResponse & {
+  readonly demo_store?: unknown;
+};
+
 interface QuoteTokenPayload {
   v: 1;
   checkoutId: string;
@@ -74,7 +82,7 @@ interface QuoteTokenPayload {
   currency: Currency;
   amount: number;
   total: number;
-  taxQuoteId: string | null;
+  taxQuoteId: string;
   normalizedHsCode: string;
   buyerFingerprint: string;
   expiresAt: number;
@@ -219,6 +227,27 @@ const providerMessage = (code: string) => {
   return 'Open Border could not complete this test request. Please try again.';
 };
 
+async function hasTrustedCustomApiProvenance(
+  client: OpenBorderGateway,
+  currency: Currency,
+): Promise<boolean> {
+  try {
+    const config = await client.getCheckoutConfig({ currency });
+    return (config as ProvenanceCheckoutConfigResponse).demo_store === 'custom_api';
+  } catch {
+    return false;
+  }
+}
+
+function sendDemoProvenanceUnavailable(res: Response): void {
+  res.status(503).json({
+    ok: false,
+    code: 'demo_provenance_unavailable',
+    message: 'The verified Custom API Sandbox provenance is unavailable.',
+    requestId: res.locals.requestId,
+  });
+}
+
 function sendError(res: Response, error: unknown) {
   const requestId = res.locals.requestId as string | undefined;
   if (error instanceof RequestValidationError) {
@@ -269,6 +298,8 @@ function verifyQuote(token: string, signingSecret: string, input: CheckoutInput)
     payload.amount !== input.amount ||
     payload.buyerFingerprint !== buyerFingerprintFor(input) ||
     payload.expiresAt <= Date.now() ||
+    typeof payload.taxQuoteId !== 'string' ||
+    payload.taxQuoteId.length === 0 ||
     !/^\d{4}\.\d{2,4}$/.test(payload.normalizedHsCode)
   ) {
     throw new RequestValidationError({ quoteToken: 'The displayed quote expired or no longer matches this checkout.' });
@@ -318,13 +349,17 @@ export function createApp(
   const chargeLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false });
 
   app.get('/health', async (_req, res) => {
-    const storeReady = durableOrders ? await store.checkReady().catch(() => false) : false;
+    const [storeReady, trustedDemoProvenance] = await Promise.all([
+      durableOrders ? store.checkReady().catch(() => false) : false,
+      hasTrustedCustomApiProvenance(client, 'USD'),
+    ]);
     res.json({
       ok: true,
       mode: 'production-sandbox',
       transactionsEnabled,
       durableOrders: storeReady,
       authenticWebhooks: authenticWebhooks && storeReady,
+      trustedDemoProvenance,
     });
   });
 
@@ -349,75 +384,43 @@ export function createApp(
     try {
       const input = parseCheckoutInput(req.body, false);
       const product = CATALOG[input.productId];
-      try {
-        const quote = await client.createTaxQuote({
-          destination_country: input.address.country,
-          ...(input.address.postal_code ? { destination_postal_code: input.address.postal_code } : {}),
-          currency: input.currency,
-          line_items: lineItemsFor(input, product.hsCode),
-          ...(input.email ? { customer: { email: input.email } } : {}),
-        });
-        const parsedExpiry = Date.parse(quote.expires_at);
-        const expiresAt = Number.isFinite(parsedExpiry)
-          ? Math.min(parsedExpiry, Date.now() + 15 * 60_000)
-          : Date.now() + 15 * 60_000;
-        res.json({
-          ok: true,
-          domestic: false,
-          taxQuoteId: quote.id,
-          normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
-          quoteToken: signQuote(
-            {
-              v: 1,
-              checkoutId: input.checkoutId,
-              productId: input.productId,
-              currency: input.currency,
-              amount: input.amount,
-              total: quote.amount_breakdown.total,
-              taxQuoteId: quote.id,
-              normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
-              buyerFingerprint: buyerFingerprintFor(input),
-              expiresAt,
-            },
-            signingSecret,
-          ),
-          amount_breakdown: quote.amount_breakdown,
-        });
-      } catch (error) {
-        if (error instanceof OpenBorderApiError && error.code === 'domestic_not_supported') {
-          res.json({
-            ok: true,
-            domestic: true,
-            taxQuoteId: null,
-            normalizedHsCode: product.hsCode,
-            quoteToken: signQuote(
-              {
-                v: 1,
-                checkoutId: input.checkoutId,
-                productId: input.productId,
-                currency: input.currency,
-                amount: input.amount,
-                total: input.amount,
-                taxQuoteId: null,
-                normalizedHsCode: product.hsCode,
-                buyerFingerprint: buyerFingerprintFor(input),
-                expiresAt: Date.now() + 15 * 60_000,
-              },
-              signingSecret,
-            ),
-            amount_breakdown: {
-              subtotal: input.amount,
-              shipping: 0,
-              tax: 0,
-              duty: 0,
-              total: input.amount,
-              currency: input.currency,
-            },
-          });
-          return;
-        }
-        throw error;
+      if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
+        sendDemoProvenanceUnavailable(res);
+        return;
       }
+      const quote = await client.createTaxQuote({
+        destination_country: input.address.country,
+        ship_from_country: 'US',
+        currency: input.currency,
+        line_items: lineItemsFor(input, product.hsCode),
+        ...(input.email ? { customer: { email: input.email } } : {}),
+      });
+      const parsedExpiry = Date.parse(quote.expires_at);
+      const expiresAt = Number.isFinite(parsedExpiry)
+        ? Math.min(parsedExpiry, Date.now() + 15 * 60_000)
+        : Date.now() + 15 * 60_000;
+      res.json({
+        ok: true,
+        domestic: input.address.country === 'US',
+        taxQuoteId: quote.id,
+        normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
+        quoteToken: signQuote(
+          {
+            v: 1,
+            checkoutId: input.checkoutId,
+            productId: input.productId,
+            currency: input.currency,
+            amount: input.amount,
+            total: quote.amount_breakdown.total,
+            taxQuoteId: quote.id,
+            normalizedHsCode: quote.classifications[0]?.hs_code ?? product.hsCode,
+            buyerFingerprint: buyerFingerprintFor(input),
+            expiresAt,
+          },
+          signingSecret,
+        ),
+        amount_breakdown: quote.amount_breakdown,
+      });
     } catch (error) {
       sendError(res, error);
     }
@@ -431,6 +434,10 @@ export function createApp(
     try {
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
+      if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
+        sendDemoProvenanceUnavailable(res);
+        return;
+      }
       const order = await store.createOrGetWithinCap({
         checkoutId: input.checkoutId,
         idempotencyKey: randomUUID(),
@@ -449,7 +456,7 @@ export function createApp(
         return;
       }
       const paymentInput: CreatePaymentIntentInput = {
-        ...(quote.taxQuoteId ? { tax_quote_id: quote.taxQuoteId } : {}),
+        tax_quote_id: quote.taxQuoteId,
         amount: input.amount,
         currency: input.currency,
         payment_method: input.paymentMethodId,
@@ -503,6 +510,9 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
 
   if (transactionCap === 0 && !readinessPrerequisitesPresent) {
     const disabledGateway: OpenBorderGateway = {
+      getCheckoutConfig: async () => {
+        throw new Error('demo_not_enabled');
+      },
       createTaxQuote: async () => {
         throw new Error('demo_not_enabled');
       },

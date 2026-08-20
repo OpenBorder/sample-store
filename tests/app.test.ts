@@ -1,7 +1,12 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import request from 'supertest';
-import { OpenBorderApiError, type PaymentIntentResponse, type TaxQuoteResponse } from '@open-border/node';
+import {
+  OpenBorderApiError,
+  type CheckoutConfigResponse,
+  type PaymentIntentResponse,
+  type TaxQuoteResponse,
+} from '@open-border/node';
 import { createApp, createConfiguredApp, type OpenBorderGateway } from '../app';
 import { createMemoryOrderStore } from '../order-store';
 
@@ -19,7 +24,6 @@ const baseInput = {
 const quote: TaxQuoteResponse = {
   id: 'tq_test_123',
   destination_country: 'GB',
-  destination_postal_code: 'SW1A 1AA',
   currency: 'GBP',
   amount_breakdown: { subtotal: 3400, shipping: 0, tax: 680, duty: 170, total: 4250, currency: 'GBP' },
   classifications: [{ index: 0, hs_code: '6110.20', confidence: 1 }],
@@ -30,18 +34,40 @@ const paymentIntent: PaymentIntentResponse = {
   id: 'pi_test_123',
   status: 'succeeded',
   entity: 'obmor_uk',
+  order_id: null,
   amount_breakdown: quote.amount_breakdown,
   client_secret: null,
+  next_action: null,
+};
+
+type ProvenanceCheckoutConfig = CheckoutConfigResponse & {
+  readonly demo_store?: 'custom_api' | 'medusa';
 };
 
 class FakeGateway implements OpenBorderGateway {
+  configCalls = 0;
+  demoStore: ProvenanceCheckoutConfig['demo_store'] = 'custom_api';
   quoteCalls = 0;
+  quoteInputs: Array<Parameters<OpenBorderGateway['createTaxQuote']>[0]> = [];
   paymentCalls: Array<{ input: Parameters<OpenBorderGateway['createPaymentIntent']>[0]; key: string }> = [];
   paymentError: Error | null = null;
   private readonly completed = new Map<string, PaymentIntentResponse>();
 
-  async createTaxQuote() {
+  async getCheckoutConfig(): Promise<ProvenanceCheckoutConfig> {
+    this.configCalls += 1;
+    return {
+      entity: 'obmor_uk',
+      provider: 'stripe',
+      publishable_key: 'pk_test_public_example',
+      currency: 'GBP',
+      country: 'GB',
+      ...(this.demoStore ? { demo_store: this.demoStore } : {}),
+    };
+  }
+
+  async createTaxQuote(input: Parameters<OpenBorderGateway['createTaxQuote']>[0]) {
     this.quoteCalls += 1;
+    this.quoteInputs.push(input);
     return quote;
   }
 
@@ -91,6 +117,57 @@ test('catalog tampering is rejected before an upstream request', async () => {
   assert.equal(gateway.quoteCalls, 0);
 });
 
+test('tax quote uses the current closed trade-lane contract', async () => {
+  const { app, gateway } = createTestApp();
+
+  await request(app).post('/quote').send(baseInput).expect(200);
+
+  assert.deepEqual(gateway.quoteInputs, [
+    {
+      destination_country: 'GB',
+      ship_from_country: 'US',
+      currency: 'GBP',
+      line_items: [
+        {
+          description: 'Classic Pullover Hoodie',
+          quantity: 1,
+          unit_amount: 3400,
+          hs_code: '6110.20',
+        },
+      ],
+      customer: { email: 'buyer@example.com' },
+    },
+  ]);
+});
+
+test('quote fails closed before tax provider I/O without trusted Custom API provenance', async () => {
+  const { app, gateway } = createTestApp();
+  gateway.demoStore = 'medusa';
+
+  const response = await request(app).post('/quote').send(baseInput).expect(503);
+
+  assert.equal(response.body.code, 'demo_provenance_unavailable');
+  assert.equal(gateway.configCalls, 1);
+  assert.equal(gateway.quoteCalls, 0);
+});
+
+test('domestic checkout still uses a server-issued tax quote', async () => {
+  const { app, gateway } = createTestApp();
+  const domesticInput = {
+    ...baseInput,
+    currency: 'USD' as const,
+    amount: 4200,
+    address: { ...baseInput.address, postal_code: '10001', country: 'US' },
+  };
+
+  const response = await request(app).post('/quote').send(domesticInput).expect(200);
+
+  assert.equal(response.body.domestic, true);
+  assert.equal(response.body.taxQuoteId, 'tq_test_123');
+  assert.equal(gateway.quoteInputs[0]?.ship_from_country, 'US');
+  assert.equal(gateway.quoteInputs[0]?.destination_country, 'US');
+});
+
 test('the displayed signed quote is charged with a stable retry key', async () => {
   const { app, gateway } = createTestApp();
   const quoteToken = await getQuoteToken(app);
@@ -108,6 +185,28 @@ test('the displayed signed quote is charged with a stable retry key', async () =
   assert.equal(gateway.paymentCalls[0]?.input.amount, 3400);
   assert.equal(gateway.paymentCalls[0]?.input.line_items[0]?.hs_code, '6110.20');
   assert.equal(gateway.paymentCalls[0]?.input.merchant_reference, `sample-store-${checkoutId}`);
+});
+
+test('charge rechecks trusted Custom API provenance before order admission or payment', async () => {
+  const gateway = new FakeGateway();
+  const store = createMemoryOrderStore();
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 1 },
+    gateway,
+    'unit-test-signing-secret',
+    { store },
+  );
+  const quoteToken = await getQuoteToken(app);
+  gateway.demoStore = undefined;
+
+  const response = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(503);
+
+  assert.equal(response.body.code, 'demo_provenance_unavailable');
+  assert.equal(gateway.paymentCalls.length, 0);
+  assert.equal(await store.getByCheckoutId(checkoutId), undefined);
 });
 
 test('a lifetime cap of one admits one checkout and refuses another before payment', async () => {

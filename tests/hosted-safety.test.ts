@@ -2,7 +2,11 @@ import { strict as assert } from 'node:assert';
 import { createHmac } from 'node:crypto';
 import { test } from 'node:test';
 import request from 'supertest';
-import type { PaymentIntentResponse, TaxQuoteResponse } from '@open-border/node';
+import type {
+  CheckoutConfigResponse,
+  PaymentIntentResponse,
+  TaxQuoteResponse,
+} from '@open-border/node';
 import {
   createApp,
   createConfiguredApp,
@@ -28,7 +32,6 @@ const input = {
 const quote: TaxQuoteResponse = {
   id: 'quote_test',
   destination_country: 'GB',
-  destination_postal_code: 'SW1A 1AA',
   currency: 'GBP',
   amount_breakdown: {
     subtotal: 3400,
@@ -42,10 +45,25 @@ const quote: TaxQuoteResponse = {
   expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
 };
 
+type ProvenanceCheckoutConfig = CheckoutConfigResponse & {
+  readonly demo_store?: 'custom_api';
+};
+
 class Gateway implements OpenBorderGateway {
   paymentCalls = 0;
 
   constructor(private readonly onPayment?: () => void) {}
+
+  async getCheckoutConfig(): Promise<ProvenanceCheckoutConfig> {
+    return {
+      entity: 'obmor_uk',
+      provider: 'stripe',
+      publishable_key: 'pk_test_public_example',
+      currency: 'GBP',
+      country: 'GB',
+      demo_store: 'custom_api',
+    };
+  }
 
   async createTaxQuote() {
     return quote;
@@ -58,8 +76,10 @@ class Gateway implements OpenBorderGateway {
       id: 'provider_reference_must_stay_private',
       status: 'processing',
       entity: 'private_routing_value' as PaymentIntentResponse['entity'],
+      order_id: null,
       amount_breakdown: quote.amount_breakdown,
       client_secret: null,
+      next_action: null,
     };
   }
 }
@@ -82,13 +102,14 @@ test('hosted runtime is healthy but transaction routes fail closed by default', 
     transactionsEnabled: false,
     durableOrders: false,
     authenticWebhooks: false,
+    trustedDemoProvenance: true,
   });
   assert.equal(quoteResponse.body.code, 'demo_not_enabled');
   assert.equal(chargeResponse.body.code, 'demo_not_enabled');
   assert.equal(gateway.paymentCalls, 0);
 });
 
-test('cap zero proves durable order and authentic webhook readiness without opening routes', async () => {
+test('cap zero proves durable order, webhook, and trusted provenance readiness without opening routes', async () => {
   const gateway = new Gateway();
   const app = createApp(
     { publishableKey: 'pk_test_public_example', transactionCap: 0 },
@@ -111,6 +132,7 @@ test('cap zero proves durable order and authentic webhook readiness without open
     transactionsEnabled: false,
     durableOrders: true,
     authenticWebhooks: true,
+    trustedDemoProvenance: true,
   });
   assert.equal(gateway.paymentCalls, 0);
 });
