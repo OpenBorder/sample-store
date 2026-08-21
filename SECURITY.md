@@ -3,8 +3,10 @@
 This repository is a public test-mode reference application.
 
 - Never commit `.env` files or Open Border credentials.
-- The hosted server starts at a lifetime transaction cap of zero, accepts only cap zero or one,
-  refuses Live keys, and accepts only the exact production-dashboard Sandbox API host.
+- The hosted server starts at a transaction cap of zero and accepts only exact integer caps from
+  zero through 50. Positive caps count orders per UTC day under a global PostgreSQL lock, and the
+  database permits only one unresolved checkout. The server refuses Live keys and accepts only the
+  exact production-dashboard Sandbox API host.
 - The secret key stays server-side; only the publishable key is returned to the browser.
 - Public product prices and tariff codes are resolved against the server catalog.
 - Displayed quotes are signed and bound to one checkout before payment creation.

@@ -1,4 +1,5 @@
 import { strict as assert } from 'node:assert';
+import { createHmac } from 'node:crypto';
 import { test } from 'node:test';
 import request from 'supertest';
 import {
@@ -81,6 +82,20 @@ class FakeGateway implements OpenBorderGateway {
     if (existing) return existing;
     this.completed.set(options.idempotencyKey, paymentIntent);
     return paymentIntent;
+  }
+}
+
+class UniquePaymentGateway extends FakeGateway {
+  readonly paymentIds: string[] = [];
+
+  override async createPaymentIntent(
+    input: Parameters<OpenBorderGateway['createPaymentIntent']>[0],
+    options: { idempotencyKey: string },
+  ) {
+    this.paymentCalls.push({ input, key: options.idempotencyKey });
+    const id = `pi_test_${input.merchant_reference}`;
+    this.paymentIds.push(id);
+    return { ...paymentIntent, id };
   }
 }
 
@@ -209,11 +224,11 @@ test('charge rechecks trusted Custom API provenance before order admission or pa
   assert.equal(await store.getByCheckoutId(checkoutId), undefined);
 });
 
-test('a lifetime cap of one admits one checkout and refuses another before payment', async () => {
+test('an unresolved checkout holds the single active claim before another payment', async () => {
   const gateway = new FakeGateway();
   const store = createMemoryOrderStore();
   const app = createApp(
-    { publishableKey: 'pk_test_public_example', transactionCap: 1 },
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
     gateway,
     'unit-test-signing-secret',
     {
@@ -236,14 +251,124 @@ test('a lifetime cap of one admits one checkout and refuses another before payme
   const capped = await request(app)
     .post('/charge')
     .send({ ...secondInput, quoteToken: secondQuote, paymentMethodId: 'pm_test_4242' })
-    .expect(503);
+    .expect(409);
 
-  assert.equal(capped.body.code, 'transaction_cap_reached');
+  assert.equal(capped.body.code, 'checkout_in_progress');
   assert.equal(gateway.paymentCalls.length, 1);
   assert.equal(await store.getByCheckoutId(secondInput.checkoutId), undefined);
 });
 
-test('concurrent distinct charges cannot exceed the lifetime cap', async () => {
+test('a UTC-day cap admits fifty reconciled checkouts, refuses the fifty-first, and resets next day', async () => {
+  let now = new Date('2026-08-21T09:00:00.000Z');
+  const store = createMemoryOrderStore({ now: () => now });
+  const gateway = new UniquePaymentGateway();
+  const webhookSecret = 'whsec_test_receiver';
+  const referenceSecret = 'private-reference-secret-for-tests';
+  const signingSecret = 'unit-test-signing-secret';
+
+  const createCappedApp = () =>
+    createApp(
+      { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+      gateway,
+      signingSecret,
+      { store, referenceSecret, webhookSecret },
+    );
+
+  const inputFor = (attempt: number) => ({
+    ...baseInput,
+    checkoutId: `00000000-0000-4000-8000-${String(attempt).padStart(12, '0')}`,
+  });
+
+  const submitAndReconcile = async (attempt: number) => {
+    const app = createCappedApp();
+    const input = inputFor(attempt);
+    const quoteToken = await getQuoteToken(app, input);
+    await request(app)
+      .post('/charge')
+      .send({ ...input, quoteToken, paymentMethodId: 'pm_test_4242' })
+      .expect(200);
+
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const delivery = `delivery_${attempt}`;
+    const body = JSON.stringify({
+      type: 'payment_intent.succeeded',
+      mode: 'test',
+      data: { paymentIntentId: gateway.paymentIds.at(-1) },
+    });
+    const signature = createHmac('sha256', webhookSecret)
+      .update(`${timestamp}.${delivery}.${body}`)
+      .digest('hex');
+    await request(app)
+      .post('/webhooks/openborder')
+      .set('Content-Type', 'application/json')
+      .set('OpenBorder-Webhook-Id', delivery)
+      .set('OpenBorder-Webhook-Timestamp', timestamp)
+      .set('OpenBorder-Webhook-Signature', `v1=${signature},t=${timestamp}`)
+      .send(body)
+      .expect(204);
+  };
+
+  for (let attempt = 1; attempt <= 50; attempt += 1) {
+    await submitAndReconcile(attempt);
+  }
+
+  const cappedApp = createCappedApp();
+  const cappedInput = inputFor(51);
+  const cappedQuote = await getQuoteToken(cappedApp, cappedInput);
+  const capped = await request(cappedApp)
+    .post('/charge')
+    .send({ ...cappedInput, quoteToken: cappedQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(503);
+  assert.equal(capped.body.code, 'transaction_cap_reached');
+  assert.equal(gateway.paymentCalls.length, 50);
+
+  now = new Date('2026-08-22T00:00:01.000Z');
+  await submitAndReconcile(51);
+  assert.equal(gateway.paymentCalls.length, 51);
+});
+
+test('health reports the configured cap, UTC-day usage, and active checkout state', async () => {
+  const store = createMemoryOrderStore();
+  const gateway = new UniquePaymentGateway();
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    {
+      store,
+      referenceSecret: 'private-reference-secret-for-tests',
+      webhookSecret: 'whsec_test_receiver',
+    },
+  );
+
+  const initial = await request(app).get('/health').expect(200);
+  assert.deepEqual(
+    {
+      transactionCap: initial.body.transactionCap,
+      transactionsUsedToday: initial.body.transactionsUsedToday,
+      activeCheckout: initial.body.activeCheckout,
+    },
+    { transactionCap: 50, transactionsUsedToday: 0, activeCheckout: false },
+  );
+
+  const quoteToken = await getQuoteToken(app);
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  const active = await request(app).get('/health').expect(200);
+  assert.deepEqual(
+    {
+      transactionCap: active.body.transactionCap,
+      transactionsUsedToday: active.body.transactionsUsedToday,
+      activeCheckout: active.body.activeCheckout,
+    },
+    { transactionCap: 50, transactionsUsedToday: 1, activeCheckout: true },
+  );
+});
+
+test('concurrent distinct charges admit only one active checkout', async () => {
   const gateway = new FakeGateway();
   const app = createApp(
     { publishableKey: 'pk_test_public_example', transactionCap: 1 },
@@ -265,7 +390,7 @@ test('concurrent distinct charges cannot exceed the lifetime cap', async () => {
 
   assert.deepEqual(
     responses.map((response) => response.status).sort(),
-    [200, 503, 503, 503],
+    [200, 409, 409, 409],
   );
   assert.equal(gateway.paymentCalls.length, 1);
 });
@@ -346,14 +471,41 @@ test('charge attempts are rate limited for public-demo safety', async () => {
   assert.equal(limited.body.error, undefined);
 });
 
-test('transaction cap defaults closed and accepts only zero or one', async () => {
+test('transaction cap defaults closed and accepts exact integers through fifty', async () => {
   const disabled = createConfiguredApp({ VERCEL_ENV: 'production' });
   assert.equal((await request(disabled).get('/health').expect(200)).body.transactionsEnabled, false);
 
-  for (const value of ['2', '10', '-1', '1.0', '01', 'true', '9007199254740993']) {
+  const enabled = createConfiguredApp({
+    VERCEL_ENV: 'production',
+    DEMO_TRANSACTION_CAP: ' 50 ',
+    OB_SECRET_KEY: 'sk_test_example',
+    OB_PUBLISHABLE_KEY: 'pk_test_example',
+    OB_API_URL: 'https://api-sandbox.openborderpayments.com',
+    DATABASE_URL: 'postgres://example.invalid/sample_store',
+    OB_WEBHOOK_SECRET: 'whsec_example',
+    ORDER_REFERENCE_HMAC_SECRET: 'r'.repeat(32),
+  });
+  assert.match(
+    (await request(enabled).get('/config.js').expect(200)).text,
+    /"transactionsEnabled":true/,
+  );
+
+  for (const value of ['-1', '1.0', '01', 'true', '51', '9007199254740993']) {
     assert.throws(
       () => createConfiguredApp({ VERCEL_ENV: 'production', DEMO_TRANSACTION_CAP: value }),
-      /DEMO_TRANSACTION_CAP must be 0 or 1/,
+      /DEMO_TRANSACTION_CAP must be an integer from 0 through 50/,
+    );
+  }
+
+  for (const transactionCap of [-1, 1.5, 51, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(
+      () =>
+        createApp(
+          { publishableKey: 'pk_test_public_example', transactionCap },
+          new FakeGateway(),
+          'unit-test-signing-secret',
+        ),
+      /transaction cap must be an integer from 0 through 50/i,
     );
   }
 });

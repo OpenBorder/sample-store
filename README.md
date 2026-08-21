@@ -44,11 +44,13 @@ Browser (public pk_)                         Backend (secret sk_)
   hashes.
 - **Displayed-total integrity.** The server signs the exact quote shown in the payment element.
   The charge must use that same unexpired quote; changed or tampered checkout data is rejected.
-- **Safe public-demo behavior.** The hosted runtime starts at a lifetime cap of zero, accepts only
-  cap `0` or `1`, admits under a database transaction so concurrent requests cannot widen the cap,
-  refuses Live keys or any API host except the production-dashboard Sandbox rail, and requires
-  server-attested `custom_api` provenance before quote or payment I/O. It also validates the five
-  catalog products, throttles per instance, and sanitizes upstream errors.
+- **Safe public-demo behavior.** The hosted runtime starts at a cap of zero and accepts only exact
+  integer caps from `0` through `50`. Positive caps count new orders per UTC day under a global
+  PostgreSQL advisory lock, while a database constraint permits only one unresolved checkout at a
+  time. Same-checkout retries keep their stable order and idempotency key. The runtime refuses Live
+  keys or any API host except the production-dashboard Sandbox rail and requires server-attested
+  `custom_api` provenance before quote or payment I/O. It also validates the five catalog products,
+  throttles per instance, and sanitizes upstream errors.
 
 This is a reference demo, not a production commerce application. It deliberately omits accounts,
 fulfilment, inventory, and live payments.
@@ -87,11 +89,12 @@ npm test
 npm run check:secrets
 ```
 
-The tests cover catalog tampering, signed displayed quotes, same-key retries, atomic lifetime-cap
-admission, cap-zero readiness, current trade-lane quoting, trusted Custom API provenance, signed
-Test-only reconciliation, changed-request rejection, provider-safe errors, malformed JSON, the
-local throttle, and Live-key refusal. CI also runs the repository secret scanner on every tracked
-and untracked source file.
+The tests cover catalog tampering, signed displayed quotes, same-key retries, atomic UTC-day cap
+admission through the 50th/51st boundary, single-active-checkout enforcement, UTC reset, cap-zero
+readiness, secret-safe cap usage health, current trade-lane quoting, trusted Custom API provenance,
+signed Test-only reconciliation, changed-request rejection, provider-safe errors, malformed JSON,
+the local throttle, and Live-key refusal. CI also runs the repository secret scanner on every
+tracked and untracked source file.
 
 For a sustained public deployment, add a platform-level rate-limit rule for `/quote` and
 `/charge`. An in-process limiter resets with serverless instances and is only a local safety net.
@@ -112,12 +115,16 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 `/charge` to.
 
 1. Import the repo in Vercel (framework preset **Other**, no build command).
-2. Apply `migrations/001_durable_orders.sql` to an owned durable Postgres database.
+2. Apply `migrations/001_durable_orders.sql`, then `migrations/002_daily_transaction_cap.sql`, to
+   an owned durable Postgres database.
 3. Configure the Test credential pair, exact Sandbox API host, webhook signing secret, database
    connection, and private-reference HMAC secret in the hosting platform.
-4. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning and provider delivery have each
-   received their own explicit approval.
-5. Deploy and verify `/health`.
+4. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning, database readiness, deployment,
+   and provider delivery have each received their own explicit approval.
+5. Deploy and verify `/health` reports cap `0`, usage `0`, no active checkout, durable storage,
+   authentic webhooks, and trusted Custom API provenance.
+6. After a separately approved activation, set `DEMO_TRANSACTION_CAP=50`; never reset the daily
+   count or bypass an unresolved checkout to finish a demo.
 
 The hosted runtime accepts Test keys only and pins `OB_API_URL` to
 `https://api-sandbox.openborderpayments.com`. With `DEMO_TRANSACTION_CAP=0`, transaction routes
