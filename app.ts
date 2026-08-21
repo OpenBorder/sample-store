@@ -567,6 +567,7 @@ export function createApp(
           ok: false,
           code: 'checkout_closed',
           message: 'This test checkout is already closed. Start a new checkout.',
+          checkoutClosed: true,
           requestId: res.locals.requestId,
         });
         return;
@@ -580,7 +581,22 @@ export function createApp(
       } catch (error) {
         if (isDefinitivePaymentFailure(error)) {
           try {
-            await store.markPaymentFailed(input.checkoutId);
+            const failureResult = await store.markPaymentFailed(input.checkoutId);
+            if (failureResult === 'terminal_noop') {
+              const terminalOrder = await store.getByCheckoutId(input.checkoutId);
+              if (terminalOrder?.status === 'paid') {
+                res.json({
+                  ok: true,
+                  checkoutId: input.checkoutId,
+                  status: 'reconciled',
+                });
+                return;
+              }
+              if (terminalOrder?.status !== 'payment_failed') {
+                sendCheckoutStateRetryRequired(res);
+                return;
+              }
+            }
           } catch {
             sendCheckoutStateRetryRequired(res);
             return;

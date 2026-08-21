@@ -568,6 +568,13 @@ test('a definitive payment decline closes the order and releases the active slot
   assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_failed');
   assert.equal((await store.getUsage()).activeCheckout, false);
 
+  const closedRetry = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(409);
+  assert.equal(closedRetry.body.code, 'checkout_closed');
+  assert.equal(closedRetry.body.checkoutClosed, true);
+
   gateway.paymentError = null;
   const nextInput = {
     ...baseInput,
@@ -622,6 +629,54 @@ test('a failed definitive-state write requires an exact locked retry', async () 
   assert.equal(gateway.paymentCalls.length, 2);
   assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
   assert.deepEqual(gateway.paymentCalls[0]?.input, gateway.paymentCalls[1]?.input);
+});
+
+test('authentic paid truth wins a definitive provider failure race', async () => {
+  const gateway = new FakeGateway();
+  const durableStore = createMemoryOrderStore();
+  const referenceSecret = 'unit-test-signing-secret';
+  const paymentReferenceHash = createHmac('sha256', referenceSecret)
+    .update(paymentIntent.id)
+    .digest('hex');
+  const store = {
+    ...durableStore,
+    markPaymentFailed: async (retryCheckoutId: string) => {
+      await durableStore.attachPaymentReference(retryCheckoutId, paymentReferenceHash);
+      await durableStore.applyWebhook({
+        deliveryHash: 'paid-wins-decline-race',
+        paymentReferenceHash,
+        status: 'paid',
+        occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+      });
+      return durableStore.markPaymentFailed(retryCheckoutId);
+    },
+  };
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    referenceSecret,
+    { store, referenceSecret },
+  );
+  const quoteToken = await getQuoteToken(app);
+  gateway.paymentError = new OpenBorderApiError(
+    'payment_declined',
+    402,
+    'Unsafe provider detail must not escape',
+  );
+
+  const response = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  assert.deepEqual(response.body, {
+    ok: true,
+    checkoutId,
+    status: 'reconciled',
+  });
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal((await store.getUsage()).activeCheckout, false);
+  assert.equal(gateway.paymentCalls.length, 1);
 });
 
 test('an idempotency conflict cannot overwrite authentic success and only the original body retries', async () => {
