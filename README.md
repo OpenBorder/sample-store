@@ -41,7 +41,10 @@ Browser (public pk_)                         Backend (secret sk_)
 - **Authentic Test-only terminal reconciliation.** Raw signed webhooks are timestamp-checked,
   replay-safe, durably deduplicated, and projected onto the persisted order only when the signed
   event declares Test mode. External delivery and payment references are stored only as keyed
-  hashes.
+  hashes. An owned terminal event that wins the response/attachment race is staged during the
+  single active-checkout window, then consumed atomically when the payment reference attaches.
+  Pending evidence is short-lived and bounded, and terminal orders never regress on retries or
+  contradictory later deliveries.
 - **Displayed-total integrity.** The server signs the exact quote shown in the payment element.
   The charge must use that same unexpired quote; changed or tampered checkout data is rejected.
 - **Safe public-demo behavior.** The hosted runtime starts at a cap of zero and accepts only exact
@@ -67,12 +70,13 @@ npm start               # http://localhost:4000
 
 Open the store, pick a **currency** in the top bar (the price and settlement region change
 with it), open a product, and click **Add to bag**. In the checkout drawer, fill in the buyer
-details — the **Order total** quotes duties & taxes for the ship-to address before payment, and
-changing the country or postal code refreshes it. The ships-from origin is the US, so a US
-address is domestic and shows no duties/taxes; pick e.g. United Kingdom or Canada to see them.
-Only after the separate provider-delivery approval, complete the approved synthetic Sandbox
-checkout. The receipt shows the commercial breakdown and retry-safe checkout reference without
-exposing provider or routing identifiers.
+details, then click **Review order total** exactly once to quote duties and taxes. Buyer or currency
+changes before that action only reset local state; after a successful quote, the final fields and
+total remain locked for that checkout. The ships-from origin is the US, so a US address is domestic
+and shows no duties/taxes; pick e.g. United Kingdom or Canada to see them. Only after the separate
+provider-delivery approval, complete the approved synthetic Sandbox checkout. The receipt shows
+the commercial breakdown and retry-safe checkout reference without exposing provider or routing
+identifiers.
 
 The server will not start with `sk_live_…` or `pk_live_…` credentials. This repository is a
 test-mode integration reference, not a live payment proxy.
@@ -92,9 +96,11 @@ npm run check:secrets
 The tests cover catalog tampering, signed displayed quotes, same-key retries, atomic UTC-day cap
 admission through the 50th/51st boundary, single-active-checkout enforcement, UTC reset, cap-zero
 readiness, secret-safe cap usage health, current trade-lane quoting, trusted Custom API provenance,
-signed Test-only reconciliation, changed-request rejection, provider-safe errors, malformed JSON,
-the local throttle, and Live-key refusal. CI also runs the repository secret scanner on every
-tracked and untracked source file.
+bounded early-webhook staging, monotonic terminal reconciliation, changed-request rejection,
+provider-safe errors, malformed JSON, the local throttle, and Live-key refusal. CI provisions a
+dedicated disposable PostgreSQL database for real multi-connection admission, attachment/webhook
+interleaving, restart durability, deduplication, and UTC-cap tests. It also runs the repository
+secret scanner on every tracked and untracked source file.
 
 For a sustained public deployment, add a platform-level rate-limit rule for `/quote` and
 `/charge`. An in-process limiter resets with serverless instances and is only a local safety net.
@@ -115,8 +121,9 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 `/charge` to.
 
 1. Import the repo in Vercel (framework preset **Other**, no build command).
-2. Apply `migrations/001_durable_orders.sql`, then `migrations/002_daily_transaction_cap.sql`, to
-   an owned durable Postgres database.
+2. Apply `migrations/001_durable_orders.sql`, `migrations/002_daily_transaction_cap.sql`, then
+   `migrations/003_webhook_reconciliation.sql`, in that order to an owned durable Postgres
+   database.
 3. Configure the Test credential pair, exact Sandbox API host, webhook signing secret, database
    connection, and private-reference HMAC secret in the hosting platform.
 4. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning, database readiness, deployment,
@@ -125,6 +132,21 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
    authentic webhooks, and trusted Custom API provenance.
 6. After a separately approved activation, set `DEMO_TRANSACTION_CAP=50`; never reset the daily
    count or bypass an unresolved checkout to finish a demo.
+
+For an upgrade of the maintained `sample-store-ten.vercel.app` production demo, the approved cap
+is already `50`. Preserve that value throughout the upgrade; do not use the fresh-install cap-zero
+transition above. Before migration or deployment, separately approve and enable a reversible edge
+maintenance rule that blocks only `POST /quote` and `POST /charge`, while leaving static/health GETs
+and `POST /webhooks/openborder` reachable. Verify both transaction routes fail closed without
+provider I/O, then record the UTC-day usage, active-checkout state, and pending-webhook count.
+
+Apply only `migrations/003_webhook_reconciliation.sql`; it is transaction-wrapped and must run with
+stop-on-error. Deploy the exact approved commit while the edge block remains enabled. Recheck the
+same aggregates and every readiness boolean before lifting the block under a separate approval.
+If any usage, active-checkout, or pending evidence drifts, keep new admissions blocked and
+reconcile on the new code. Roll application code back only when no checkout or pending evidence is
+active, and leave the additive migration installed. Changing the cap, creating a quote, starting a
+checkout, or replaying a webhook requires its own explicit approval.
 
 The hosted runtime accepts Test keys only and pins `OB_API_URL` to
 `https://api-sandbox.openborderpayments.com`. With `DEMO_TRANSACTION_CAP=0`, transaction routes

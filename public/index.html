@@ -1001,6 +1001,15 @@
         font-size: 0.76rem;
         margin: 8px 0 0;
       }
+      .quote-action {
+        width: 100%;
+        margin-top: 14px;
+      }
+      .quote-action:disabled {
+        cursor: not-allowed;
+        opacity: 0.58;
+        transform: none;
+      }
       .payment-placeholder {
         margin-top: 4px;
         border: 1px dashed #c7c9d3;
@@ -1260,17 +1269,17 @@
 
         <section class="checkout-section">
           <h3><span>1</span> Contact &amp; shipping</h3>
-          <label class="stack">Email<input id="email" type="email" placeholder="you@example.com" /></label>
-          <label class="stack">Name<input id="name" type="text" placeholder="Ada Lovelace" /></label>
-          <label class="stack">Address<input id="line1" type="text" placeholder="1 Market St" /></label>
+          <label class="stack">Email<input id="email" type="email" placeholder="you@example.com" required /></label>
+          <label class="stack">Name<input id="name" type="text" placeholder="Ada Lovelace" required /></label>
+          <label class="stack">Address<input id="line1" type="text" placeholder="1 Market St" required /></label>
           <div class="two">
-            <label class="stack">City<input id="city" type="text" placeholder="San Francisco" /></label>
-            <label class="stack">Postal code<input id="postal_code" type="text" placeholder="94105" /></label>
+            <label class="stack">City<input id="city" type="text" placeholder="San Francisco" required /></label>
+            <label class="stack">Postal code<input id="postal_code" type="text" placeholder="94105" required /></label>
           </div>
           <label class="stack"
             >Country
             <span class="select-shell">
-              <select id="country">
+              <select id="country" required>
                 <option value="US" selected>United States (domestic)</option>
                 <option value="GB">United Kingdom</option>
                 <option value="CA">Canada</option>
@@ -1298,7 +1307,10 @@
             <dt>Total</dt>
             <dd id="tot-total" class="tot-total">—</dd>
           </dl>
-          <p class="totals-note" id="totals-note"></p>
+          <p class="totals-note" id="totals-note">Enter the final buyer details, then request one landed-cost quote.</p>
+          <button class="buy quote-action" id="review-total" type="button" aria-describedby="totals-note">
+            Review order total
+          </button>
         </section>
 
         <section class="checkout-section">

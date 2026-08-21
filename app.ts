@@ -222,10 +222,61 @@ const buyerFingerprintFor = (input: CheckoutInput) =>
 
 const providerMessage = (code: string) => {
   if (code === 'validation_error') return 'Check the checkout details and try again.';
-  if (code === 'payment_declined') return 'The test payment was declined. Try another test card.';
-  if (code === 'idempotency_conflict') return 'This checkout changed after submission. Start a new checkout.';
+  if (code === 'payment_declined') return 'The test payment was declined.';
+  if (code === 'idempotency_key_conflict') {
+    return 'Payment status is unknown. Retry only this locked checkout.';
+  }
   return 'Open Border could not complete this test request. Please try again.';
 };
+
+const isDefinitivePaymentFailure = (error: unknown): error is OpenBorderApiError =>
+  error instanceof OpenBorderApiError &&
+  ['payment_declined', 'validation_error'].includes(error.code);
+
+function sendPaymentOutcomeUnknown(res: Response, error: unknown): void {
+  const requestId = res.locals.requestId as string | undefined;
+  if (error instanceof OpenBorderApiError) {
+    const status = error.status >= 400 && error.status < 500 ? error.status : 502;
+    res.status(status).json({
+      ok: false,
+      code: error.code,
+      message: providerMessage(error.code),
+      outcomeUnknown: true,
+      requestId,
+    });
+    return;
+  }
+  res.status(502).json({
+    ok: false,
+    code: 'payment_status_unknown',
+    message: 'Payment status is unknown. Retry only this locked checkout.',
+    outcomeUnknown: true,
+    requestId,
+  });
+}
+
+function sendClosedCheckout(res: Response, error: OpenBorderApiError): void {
+  const message = error.code === 'payment_declined'
+    ? 'The test payment was declined. Close this checkout and start a new one with another test card.'
+    : 'The payment request was rejected. Close this checkout and start a new one.';
+  res.status(error.status >= 400 && error.status < 500 ? error.status : 502).json({
+    ok: false,
+    code: error.code,
+    message,
+    checkoutClosed: true,
+    requestId: res.locals.requestId,
+  });
+}
+
+function sendCheckoutStateRetryRequired(res: Response): void {
+  res.status(503).json({
+    ok: false,
+    code: 'checkout_state_retry_required',
+    message: 'The payment was declined, but the checkout could not be safely closed. Retry only this locked checkout.',
+    retrySameCheckout: true,
+    requestId: res.locals.requestId,
+  });
+}
 
 async function hasTrustedCustomApiProvenance(
   client: OpenBorderGateway,
@@ -252,6 +303,16 @@ function sendError(res: Response, error: unknown) {
   const requestId = res.locals.requestId as string | undefined;
   if (error instanceof RequestValidationError) {
     res.status(400).json({ ok: false, code: 'validation_error', message: error.message, fields: error.fields, requestId });
+    return;
+  }
+  if (error instanceof Error && error.message === 'order_reference_conflict') {
+    res.status(409).json({
+      ok: false,
+      code: 'checkout_retry_mismatch',
+      message: 'This request does not match the locked checkout. Retry only the original payment.',
+      outcomeUnknown: true,
+      requestId,
+    });
     return;
   }
   if (error instanceof OpenBorderApiError) {
@@ -392,6 +453,10 @@ export function createApp(
       return;
     }
     try {
+      if (!(await store.checkReady().catch(() => false))) {
+        res.status(503).json({ ok: false, code: 'demo_not_ready' });
+        return;
+      }
       const input = parseCheckoutInput(req.body, false);
       const product = CATALOG[input.productId];
       if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
@@ -442,15 +507,34 @@ export function createApp(
       return;
     }
     try {
+      if (!(await store.checkReady().catch(() => false))) {
+        res.status(503).json({ ok: false, code: 'demo_not_ready' });
+        return;
+      }
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
       if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
         sendDemoProvenanceUnavailable(res);
         return;
       }
+      const paymentInput: CreatePaymentIntentInput = {
+        tax_quote_id: quote.taxQuoteId,
+        amount: input.amount,
+        currency: input.currency,
+        payment_method: input.paymentMethodId,
+        customer: { email: input.email!, ...(input.name ? { name: input.name } : {}) },
+        billing_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
+        shipping_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
+        line_items: lineItemsFor(input, quote.normalizedHsCode),
+        merchant_reference: `sample-store-${input.checkoutId}`,
+        metadata: { demo: 'custom-api-reference', checkout_id: input.checkoutId },
+      };
       const order = await store.createOrGetWithinCap({
         checkoutId: input.checkoutId,
-        idempotencyKey: randomUUID(),
+        idempotencyKey: hashPrivateReference(
+          referenceSecret,
+          `payment-submission\0${JSON.stringify(paymentInput)}`,
+        ),
         status: 'awaiting_payment',
         productId: input.productId,
         amount: input.amount,
@@ -474,26 +558,64 @@ export function createApp(
         });
         return;
       }
-      const paymentInput: CreatePaymentIntentInput = {
-        tax_quote_id: quote.taxQuoteId,
-        amount: input.amount,
-        currency: input.currency,
-        payment_method: input.paymentMethodId,
-        customer: { email: input.email!, ...(input.name ? { name: input.name } : {}) },
-        billing_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
-        shipping_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
-        line_items: lineItemsFor(input, quote.normalizedHsCode),
-        merchant_reference: `sample-store-${input.checkoutId}`,
-        metadata: { demo: 'custom-api-reference', checkout_id: input.checkoutId },
-      };
+      if (order.status === 'paid') {
+        res.json({ ok: true, checkoutId: input.checkoutId, status: 'reconciled' });
+        return;
+      }
+      if (order.status === 'payment_failed') {
+        res.status(409).json({
+          ok: false,
+          code: 'checkout_closed',
+          message: 'This test checkout is already closed. Start a new checkout.',
+          checkoutClosed: true,
+          requestId: res.locals.requestId,
+        });
+        return;
+      }
 
-      const paymentIntent = await client.createPaymentIntent(paymentInput, {
-        idempotencyKey: order.idempotencyKey,
-      });
-      await store.attachPaymentReference(
-        input.checkoutId,
-        hashPrivateReference(referenceSecret, paymentIntent.id),
-      );
+      let paymentIntent: PaymentIntentResponse;
+      try {
+        paymentIntent = await client.createPaymentIntent(paymentInput, {
+          idempotencyKey: order.idempotencyKey,
+        });
+      } catch (error) {
+        if (isDefinitivePaymentFailure(error)) {
+          try {
+            const failureResult = await store.markPaymentFailed(input.checkoutId);
+            if (failureResult === 'terminal_noop') {
+              const terminalOrder = await store.getByCheckoutId(input.checkoutId);
+              if (terminalOrder?.status === 'paid') {
+                res.json({
+                  ok: true,
+                  checkoutId: input.checkoutId,
+                  status: 'reconciled',
+                });
+                return;
+              }
+              if (terminalOrder?.status !== 'payment_failed') {
+                sendCheckoutStateRetryRequired(res);
+                return;
+              }
+            }
+          } catch {
+            sendCheckoutStateRetryRequired(res);
+            return;
+          }
+          sendClosedCheckout(res, error);
+          return;
+        }
+        sendPaymentOutcomeUnknown(res, error);
+        return;
+      }
+      try {
+        await store.attachPaymentReference(
+          input.checkoutId,
+          hashPrivateReference(referenceSecret, paymentIntent.id),
+        );
+      } catch (error) {
+        sendPaymentOutcomeUnknown(res, error);
+        return;
+      }
       res.json({
         ok: true,
         checkoutId: input.checkoutId,

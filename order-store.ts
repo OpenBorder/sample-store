@@ -1,4 +1,4 @@
-import type { Sql } from 'postgres';
+import type { Sql, TransactionSql } from 'postgres';
 
 export type OrderStatus =
   | 'awaiting_payment'
@@ -22,6 +22,11 @@ export interface OrderStoreUsage {
 
 /** Serializes the UTC-day cap and active-checkout checks across application instances. */
 const TRANSACTION_CAP_LOCK_KEY = 194_837_201;
+const PENDING_WEBHOOK_LOCK_KEY = 194_837_202;
+const PAYMENT_REFERENCE_LOCK_SEED = 645;
+const MAX_PENDING_WEBHOOKS = 8;
+const PENDING_WEBHOOK_RETENTION_SECONDS = 15 * 60;
+const PENDING_WEBHOOK_RETENTION_MS = PENDING_WEBHOOK_RETENTION_SECONDS * 1000;
 
 export interface OrderStore {
   checkReady(): Promise<boolean>;
@@ -31,13 +36,24 @@ export interface OrderStore {
     transactionCap: number,
   ): Promise<StoredOrder | 'active_checkout' | 'cap_reached'>;
   getByCheckoutId(checkoutId: string): Promise<StoredOrder | undefined>;
-  attachPaymentReference(checkoutId: string, paymentReferenceHash: string): Promise<void>;
+  attachPaymentReference(
+    checkoutId: string,
+    paymentReferenceHash: string,
+  ): Promise<'attached' | 'terminal_noop'>;
+  markPaymentFailed(checkoutId: string): Promise<'applied' | 'terminal_noop'>;
   applyWebhook(input: {
     deliveryHash: string;
     paymentReferenceHash: string;
     status: Extract<OrderStatus, 'paid' | 'payment_failed'>;
     occurredAt: Date;
-  }): Promise<'applied' | 'duplicate' | 'unknown_order'>;
+  }): Promise<
+    | 'applied'
+    | 'capacity_reached'
+    | 'duplicate'
+    | 'staged'
+    | 'terminal_noop'
+    | 'unowned'
+  >;
   purgeDeliveriesBefore(cutoff: Date): Promise<number>;
 }
 
@@ -48,6 +64,15 @@ export function createMemoryOrderStore(
   const createdAt = new Map<string, Date>();
   const paymentReferences = new Map<string, string>();
   const deliveries = new Map<string, Date>();
+  const pendingDeliveries = new Map<
+    string,
+    {
+      paymentReferenceHash: string;
+      status: Extract<OrderStatus, 'paid' | 'payment_failed'>;
+      occurredAt: Date;
+      receivedAt: Date;
+    }
+  >();
   const now = options.now ?? (() => new Date());
 
   return {
@@ -95,14 +120,61 @@ export function createMemoryOrderStore(
     attachPaymentReference: async (checkoutId, paymentReferenceHash) => {
       const order = requireOrder(orders, checkoutId);
       paymentReferences.set(paymentReferenceHash, checkoutId);
+      if (isTerminal(order.status)) return 'terminal_noop';
       orders.set(checkoutId, { ...order, status: 'payment_submitted' });
+      const pendingCutoff = new Date(now().getTime() - PENDING_WEBHOOK_RETENTION_MS);
+      for (const [deliveryHash, delivery] of pendingDeliveries) {
+        if (delivery.receivedAt < pendingCutoff) pendingDeliveries.delete(deliveryHash);
+      }
+      const pending = [...pendingDeliveries.entries()]
+        .filter(([, delivery]) => delivery.paymentReferenceHash === paymentReferenceHash)
+        .sort((left, right) => {
+          const byTime = left[1].occurredAt.getTime() - right[1].occurredAt.getTime();
+          return byTime || left[0].localeCompare(right[0]);
+        });
+      for (const [deliveryHash, delivery] of pending) {
+        pendingDeliveries.delete(deliveryHash);
+        deliveries.set(deliveryHash, now());
+        const current = requireOrder(orders, checkoutId);
+        if (!isTerminal(current.status)) {
+          orders.set(checkoutId, { ...current, status: delivery.status });
+        }
+      }
+      return 'attached';
+    },
+    markPaymentFailed: async (checkoutId) => {
+      const order = requireOrder(orders, checkoutId);
+      if (isTerminal(order.status)) return 'terminal_noop';
+      orders.set(checkoutId, { ...order, status: 'payment_failed' });
+      return 'applied';
     },
     applyWebhook: async (input) => {
-      if (deliveries.has(input.deliveryHash)) return 'duplicate';
+      if (deliveries.has(input.deliveryHash) || pendingDeliveries.has(input.deliveryHash)) {
+        return 'duplicate';
+      }
       const checkoutId = paymentReferences.get(input.paymentReferenceHash);
-      if (!checkoutId) return 'unknown_order';
+      if (!checkoutId) {
+        const pendingCutoff = new Date(now().getTime() - PENDING_WEBHOOK_RETENTION_MS);
+        for (const [deliveryHash, delivery] of pendingDeliveries) {
+          if (delivery.receivedAt < pendingCutoff) pendingDeliveries.delete(deliveryHash);
+        }
+        const hasActiveCheckout = [...orders.values()].some(
+          (stored) =>
+            stored.status === 'awaiting_payment' || stored.status === 'payment_submitted',
+        );
+        if (!hasActiveCheckout) return 'unowned';
+        if (pendingDeliveries.size >= MAX_PENDING_WEBHOOKS) return 'capacity_reached';
+        pendingDeliveries.set(input.deliveryHash, {
+          paymentReferenceHash: input.paymentReferenceHash,
+          status: input.status,
+          occurredAt: input.occurredAt,
+          receivedAt: now(),
+        });
+        return 'staged';
+      }
       const order = requireOrder(orders, checkoutId);
-      deliveries.set(input.deliveryHash, input.occurredAt);
+      deliveries.set(input.deliveryHash, now());
+      if (isTerminal(order.status)) return 'terminal_noop';
       orders.set(checkoutId, { ...order, status: input.status });
       return 'applied';
     },
@@ -111,6 +183,12 @@ export function createMemoryOrderStore(
       for (const [deliveryHash, receivedAt] of deliveries) {
         if (receivedAt < cutoff) {
           deliveries.delete(deliveryHash);
+          purged += 1;
+        }
+      }
+      for (const [deliveryHash, delivery] of pendingDeliveries) {
+        if (delivery.receivedAt < cutoff) {
+          pendingDeliveries.delete(deliveryHash);
           purged += 1;
         }
       }
@@ -129,6 +207,9 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
         deliveries: string | null;
         deliveryRetention: string | null;
         orders: string | null;
+        pendingDeliveries: string | null;
+        pendingReference: string | null;
+        pendingRetention: string | null;
       }[]>`
         SELECT
           to_regclass('sample_store_orders')::text AS orders,
@@ -137,14 +218,23 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
             AS "deliveryRetention",
           to_regclass('sample_store_orders_utc_day_idx')::text AS "dailyCap",
           to_regclass('sample_store_orders_single_active_idx')::text
-            AS "activeCheckout"
+            AS "activeCheckout",
+          to_regclass('sample_store_pending_webhooks')::text
+            AS "pendingDeliveries",
+          to_regclass('sample_store_pending_webhooks_reference_idx')::text
+            AS "pendingReference",
+          to_regclass('sample_store_pending_webhooks_retention_idx')::text
+            AS "pendingRetention"
       `;
       return Boolean(
         rows[0]?.orders &&
           rows[0]?.deliveries &&
           rows[0]?.deliveryRetention &&
           rows[0]?.dailyCap &&
-          rows[0]?.activeCheckout,
+          rows[0]?.activeCheckout &&
+          rows[0]?.pendingDeliveries &&
+          rows[0]?.pendingReference &&
+          rows[0]?.pendingRetention,
       );
     },
     getUsage: async () => {
@@ -229,17 +319,104 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
       }),
     getByCheckoutId: (checkoutId) => getOrder(sql, checkoutId),
     attachPaymentReference: async (checkoutId, paymentReferenceHash) => {
+      return sql.begin(async (transaction) => {
+        await lockPaymentReference(transaction, paymentReferenceHash);
+        const orders = await transaction<{ status: OrderStatus; paymentReferenceHash: string | null }[]>`
+          SELECT status, payment_reference_hash AS "paymentReferenceHash"
+          FROM sample_store_orders
+          WHERE checkout_id = ${checkoutId}
+          FOR UPDATE
+        `;
+        const order = orders[0];
+        if (!order) throw new Error('order_not_found');
+        if (order.paymentReferenceHash && order.paymentReferenceHash !== paymentReferenceHash) {
+          throw new Error('payment_reference_conflict');
+        }
+        if (!order.paymentReferenceHash) {
+          await transaction`
+            UPDATE sample_store_orders
+            SET payment_reference_hash = ${paymentReferenceHash},
+                status = CASE
+                  WHEN status IN ('awaiting_payment', 'payment_submitted')
+                    THEN 'payment_submitted'
+                  ELSE status
+                END,
+                updated_at = now()
+            WHERE checkout_id = ${checkoutId}
+          `;
+        }
+        await transaction`
+          DELETE FROM sample_store_pending_webhooks
+          WHERE payment_reference_hash = ${paymentReferenceHash}
+            AND received_at < now() - ${PENDING_WEBHOOK_RETENTION_SECONDS} * interval '1 second'
+        `;
+        const pending = await transaction<{
+          deliveryHash: string;
+          status: Extract<OrderStatus, 'paid' | 'payment_failed'>;
+          occurredAt: Date;
+        }[]>`
+          SELECT
+            delivery_hash AS "deliveryHash",
+            terminal_status AS status,
+            occurred_at AS "occurredAt"
+          FROM sample_store_pending_webhooks
+          WHERE payment_reference_hash = ${paymentReferenceHash}
+          ORDER BY occurred_at, delivery_hash
+          FOR UPDATE
+        `;
+        let terminalApplied = isTerminal(order.status);
+        for (const delivery of pending) {
+          await transaction`
+            INSERT INTO sample_store_webhook_deliveries (
+              delivery_hash,
+              checkout_id,
+              received_at
+            )
+            VALUES (${delivery.deliveryHash}, ${checkoutId}, now())
+            ON CONFLICT (delivery_hash) DO NOTHING
+          `;
+          if (!terminalApplied) {
+            await transaction`
+              UPDATE sample_store_orders
+              SET status = ${delivery.status}, updated_at = now()
+              WHERE checkout_id = ${checkoutId}
+                AND status IN ('awaiting_payment', 'payment_submitted')
+            `;
+            terminalApplied = true;
+          }
+        }
+        if (pending.length > 0) {
+          await transaction`
+            DELETE FROM sample_store_pending_webhooks
+            WHERE payment_reference_hash = ${paymentReferenceHash}
+          `;
+        }
+        return isTerminal(order.status) ? 'terminal_noop' as const : 'attached' as const;
+      });
+    },
+    markPaymentFailed: async (checkoutId) => {
       const rows = await sql`
         UPDATE sample_store_orders
-        SET payment_reference_hash = ${paymentReferenceHash},
-            status = 'payment_submitted',
-            updated_at = now()
+        SET status = 'payment_failed', updated_at = now()
         WHERE checkout_id = ${checkoutId}
+          AND status IN ('awaiting_payment', 'payment_submitted')
       `;
-      if (rows.count !== 1) throw new Error('order_not_found');
+      if (rows.count === 1) return 'applied' as const;
+      const existing = await getOrder(sql, checkoutId);
+      if (!existing) throw new Error('order_not_found');
+      return 'terminal_noop' as const;
     },
     applyWebhook: async (input) =>
       sql.begin(async (transaction) => {
+        await lockPaymentReference(transaction, input.paymentReferenceHash);
+        const accepted = await transaction<{ present: boolean }[]>`
+          SELECT EXISTS (
+            SELECT 1
+            FROM sample_store_webhook_deliveries
+            WHERE delivery_hash = ${input.deliveryHash}
+          ) AS present
+        `;
+        if (accepted[0]?.present) return 'duplicate' as const;
         const orders = await transaction<{ checkoutId: string }[]>`
           SELECT checkout_id AS "checkoutId"
           FROM sample_store_orders
@@ -247,32 +424,95 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
           FOR UPDATE
         `;
         const order = orders[0];
-        if (!order) return 'unknown_order' as const;
+        if (!order) {
+          await transaction`SELECT pg_advisory_xact_lock(${PENDING_WEBHOOK_LOCK_KEY})`;
+          await transaction`
+            DELETE FROM sample_store_pending_webhooks
+            WHERE received_at < now() - ${PENDING_WEBHOOK_RETENTION_SECONDS} * interval '1 second'
+          `;
+          const pendingDelivery = await transaction<{ present: boolean }[]>`
+            SELECT EXISTS (
+              SELECT 1
+              FROM sample_store_pending_webhooks
+              WHERE delivery_hash = ${input.deliveryHash}
+            ) AS present
+          `;
+          if (pendingDelivery[0]?.present) return 'duplicate' as const;
+          const ownership = await transaction<{ active: boolean; pending: number }[]>`
+            SELECT
+              EXISTS (
+                SELECT 1
+                FROM sample_store_orders
+                WHERE status IN ('awaiting_payment', 'payment_submitted')
+              ) AS active,
+              (SELECT count(*)::int FROM sample_store_pending_webhooks) AS pending
+          `;
+          if (!ownership[0]?.active) return 'unowned' as const;
+          if ((ownership[0]?.pending ?? 0) >= MAX_PENDING_WEBHOOKS) {
+            return 'capacity_reached' as const;
+          }
+          const staged = await transaction`
+            INSERT INTO sample_store_pending_webhooks (
+              delivery_hash,
+              payment_reference_hash,
+              terminal_status,
+              occurred_at
+            )
+            VALUES (
+              ${input.deliveryHash},
+              ${input.paymentReferenceHash},
+              ${input.status},
+              ${input.occurredAt}
+            )
+            ON CONFLICT (delivery_hash) DO NOTHING
+          `;
+          return staged.count === 1 ? 'staged' as const : 'duplicate' as const;
+        }
         const deliveries = await transaction`
           INSERT INTO sample_store_webhook_deliveries (
             delivery_hash,
             checkout_id,
             received_at
           )
-          VALUES (${input.deliveryHash}, ${order.checkoutId}, ${input.occurredAt})
+          VALUES (${input.deliveryHash}, ${order.checkoutId}, now())
           ON CONFLICT (delivery_hash) DO NOTHING
         `;
         if (deliveries.count === 0) return 'duplicate' as const;
-        await transaction`
+        const updated = await transaction`
           UPDATE sample_store_orders
           SET status = ${input.status}, updated_at = now()
           WHERE checkout_id = ${order.checkoutId}
+            AND status IN ('awaiting_payment', 'payment_submitted')
         `;
-        return 'applied' as const;
+        return updated.count === 1 ? 'applied' as const : 'terminal_noop' as const;
       }),
     purgeDeliveriesBefore: async (cutoff) => {
       const rows = await sql`
         DELETE FROM sample_store_webhook_deliveries
         WHERE received_at < ${cutoff}
       `;
-      return rows.count;
+      const pending = await sql`
+        DELETE FROM sample_store_pending_webhooks
+        WHERE received_at < ${cutoff}
+      `;
+      return rows.count + pending.count;
     },
   };
+}
+
+async function lockPaymentReference(
+  sql: Sql | TransactionSql,
+  paymentReferenceHash: string,
+): Promise<void> {
+  await sql`
+    SELECT pg_advisory_xact_lock(
+      hashtextextended(${paymentReferenceHash}, ${PAYMENT_REFERENCE_LOCK_SEED})
+    )
+  `;
+}
+
+function isTerminal(status: OrderStatus): status is 'paid' | 'payment_failed' {
+  return status === 'paid' || status === 'payment_failed';
 }
 
 function startOfUtcDay(value: Date): Date {
@@ -298,6 +538,7 @@ async function getOrder(sql: Sql, checkoutId: string): Promise<StoredOrder | und
 
 function assertSameOrder(existing: StoredOrder, requested: StoredOrder) {
   if (
+    existing.idempotencyKey !== requested.idempotencyKey ||
     existing.productId !== requested.productId ||
     existing.amount !== requested.amount ||
     existing.currency !== requested.currency

@@ -166,6 +166,26 @@ test('quote fails closed before tax provider I/O without trusted Custom API prov
   assert.equal(gateway.quoteCalls, 0);
 });
 
+test('quote and charge fail closed before provider I/O when durable storage is not ready', async () => {
+  const gateway = new FakeGateway();
+  const store = {
+    ...createMemoryOrderStore(),
+    checkReady: async () => false,
+  };
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    { store },
+  );
+
+  assert.equal((await request(app).post('/quote').send(baseInput).expect(503)).body.code, 'demo_not_ready');
+  assert.equal((await request(app).post('/charge').send(baseInput).expect(503)).body.code, 'demo_not_ready');
+  assert.equal(gateway.configCalls, 0);
+  assert.equal(gateway.quoteCalls, 0);
+  assert.equal(gateway.paymentCalls.length, 0);
+});
+
 test('domestic checkout still uses a server-issued tax quote', async () => {
   const { app, gateway } = createTestApp();
   const domesticInput = {
@@ -194,7 +214,7 @@ test('the displayed signed quote is charged with a stable retry key', async () =
   assert.equal(first.body.status, 'payment_submitted');
   assert.equal(replay.body.status, 'payment_submitted');
   assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
-  assert.match(gateway.paymentCalls[0]?.key ?? '', /^[0-9a-f-]{36}$/);
+  assert.match(gateway.paymentCalls[0]?.key ?? '', /^[0-9a-f]{64}$/);
   assert.doesNotMatch(JSON.stringify(first.body), /pi_test_123|obmor_uk/);
   assert.equal(gateway.paymentCalls[0]?.input.tax_quote_id, 'tq_test_123');
   assert.equal(gateway.paymentCalls[0]?.input.amount, 3400);
@@ -293,7 +313,8 @@ test('a UTC-day cap admits fifty reconciled checkouts, refuses the fifty-first, 
     const body = JSON.stringify({
       type: 'payment_intent.succeeded',
       mode: 'test',
-      data: { paymentIntentId: gateway.paymentIds.at(-1) },
+      occurredAt: new Date(Number(timestamp) * 1000).toISOString(),
+      data: { paymentIntentId: gateway.paymentIds.at(-1), demoStore: 'custom_api' },
     });
     const signature = createHmac('sha256', webhookSecret)
       .update(`${timestamp}.${delivery}.${body}`)
@@ -434,7 +455,14 @@ test('a modified quote token is rejected', async () => {
 });
 
 test('provider errors return stable safe text and a request id', async () => {
-  const { app, gateway } = createTestApp();
+  const gateway = new FakeGateway();
+  const store = createMemoryOrderStore();
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    { store },
+  );
   const quoteToken = await getQuoteToken(app);
   gateway.paymentError = new OpenBorderApiError(
     'provider_unavailable',
@@ -446,9 +474,269 @@ test('provider errors return stable safe text and a request id', async () => {
     .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
     .expect(502);
   assert.equal(response.body.code, 'provider_unavailable');
+  assert.equal(response.body.outcomeUnknown, true);
   assert.equal(response.body.message, 'Open Border could not complete this test request. Please try again.');
   assert.doesNotMatch(JSON.stringify(response.body), /acct_secret|raw response/);
   assert.match(response.body.requestId, /^[0-9a-f-]{36}$/);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+
+  gateway.paymentError = null;
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+});
+
+test('post-provider attachment failure stays ambiguous and an exact retry drains staged success', async () => {
+  const gateway = new FakeGateway();
+  const durableStore = createMemoryOrderStore();
+  const referenceSecret = 'unit-test-signing-secret';
+  let failAttachment = true;
+  const store = {
+    ...durableStore,
+    attachPaymentReference: async (retryCheckoutId: string, paymentReferenceHash: string) => {
+      if (failAttachment) {
+        failAttachment = false;
+        throw new Error('simulated_attachment_failure');
+      }
+      return durableStore.attachPaymentReference(retryCheckoutId, paymentReferenceHash);
+    },
+  };
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    referenceSecret,
+    { store, referenceSecret },
+  );
+  const quoteToken = await getQuoteToken(app);
+  const chargeBody = { ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' };
+
+  const ambiguous = await request(app).post('/charge').send(chargeBody).expect(502);
+  assert.equal(ambiguous.body.code, 'payment_status_unknown');
+  assert.equal(ambiguous.body.outcomeUnknown, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+  assert.equal((await store.getUsage()).activeCheckout, true);
+
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'attachment-success-delivery',
+      paymentReferenceHash: createHmac('sha256', referenceSecret)
+        .update(paymentIntent.id)
+        .digest('hex'),
+      status: 'paid',
+      occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+    }),
+    'staged',
+  );
+
+  await request(app).post('/charge').send(chargeBody).expect(200);
+  assert.equal(gateway.paymentCalls.length, 2);
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+  assert.deepEqual(gateway.paymentCalls[0]?.input, gateway.paymentCalls[1]?.input);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal((await store.getUsage()).activeCheckout, false);
+});
+
+test('a definitive payment decline closes the order and releases the active slot', async () => {
+  const gateway = new FakeGateway();
+  const store = createMemoryOrderStore();
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    { store },
+  );
+  const quoteToken = await getQuoteToken(app);
+  gateway.paymentError = new OpenBorderApiError(
+    'payment_declined',
+    402,
+    'Unsafe provider detail must not escape',
+  );
+
+  const declined = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(402);
+
+  assert.equal(declined.body.code, 'payment_declined');
+  assert.equal(declined.body.checkoutClosed, true);
+  assert.equal(
+    declined.body.message,
+    'The test payment was declined. Close this checkout and start a new one with another test card.',
+  );
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_failed');
+  assert.equal((await store.getUsage()).activeCheckout, false);
+
+  const closedRetry = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(409);
+  assert.equal(closedRetry.body.code, 'checkout_closed');
+  assert.equal(closedRetry.body.checkoutClosed, true);
+
+  gateway.paymentError = null;
+  const nextInput = {
+    ...baseInput,
+    checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72',
+  };
+  const nextQuote = await getQuoteToken(app, nextInput);
+  await request(app)
+    .post('/charge')
+    .send({ ...nextInput, quoteToken: nextQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+  assert.equal(gateway.paymentCalls.length, 2);
+});
+
+test('a failed definitive-state write requires an exact locked retry', async () => {
+  const gateway = new FakeGateway();
+  const durableStore = createMemoryOrderStore();
+  let failStateWrite = true;
+  const store = {
+    ...durableStore,
+    markPaymentFailed: async (retryCheckoutId: string) => {
+      if (failStateWrite) {
+        failStateWrite = false;
+        throw new Error('simulated_state_write_failure');
+      }
+      return durableStore.markPaymentFailed(retryCheckoutId);
+    },
+  };
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    { store },
+  );
+  const quoteToken = await getQuoteToken(app);
+  const chargeBody = { ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' };
+  gateway.paymentError = new OpenBorderApiError(
+    'payment_declined',
+    402,
+    'Unsafe provider detail must not escape',
+  );
+
+  const retryRequired = await request(app).post('/charge').send(chargeBody).expect(503);
+  assert.equal(retryRequired.body.code, 'checkout_state_retry_required');
+  assert.equal(retryRequired.body.retrySameCheckout, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+  assert.equal((await store.getUsage()).activeCheckout, true);
+
+  const declined = await request(app).post('/charge').send(chargeBody).expect(402);
+  assert.equal(declined.body.checkoutClosed, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_failed');
+  assert.equal((await store.getUsage()).activeCheckout, false);
+  assert.equal(gateway.paymentCalls.length, 2);
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+  assert.deepEqual(gateway.paymentCalls[0]?.input, gateway.paymentCalls[1]?.input);
+});
+
+test('authentic paid truth wins a definitive provider failure race', async () => {
+  const gateway = new FakeGateway();
+  const durableStore = createMemoryOrderStore();
+  const referenceSecret = 'unit-test-signing-secret';
+  const paymentReferenceHash = createHmac('sha256', referenceSecret)
+    .update(paymentIntent.id)
+    .digest('hex');
+  const store = {
+    ...durableStore,
+    markPaymentFailed: async (retryCheckoutId: string) => {
+      await durableStore.attachPaymentReference(retryCheckoutId, paymentReferenceHash);
+      await durableStore.applyWebhook({
+        deliveryHash: 'paid-wins-decline-race',
+        paymentReferenceHash,
+        status: 'paid',
+        occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+      });
+      return durableStore.markPaymentFailed(retryCheckoutId);
+    },
+  };
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    referenceSecret,
+    { store, referenceSecret },
+  );
+  const quoteToken = await getQuoteToken(app);
+  gateway.paymentError = new OpenBorderApiError(
+    'payment_declined',
+    402,
+    'Unsafe provider detail must not escape',
+  );
+
+  const response = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  assert.deepEqual(response.body, {
+    ok: true,
+    checkoutId,
+    status: 'reconciled',
+  });
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal((await store.getUsage()).activeCheckout, false);
+  assert.equal(gateway.paymentCalls.length, 1);
+});
+
+test('an idempotency conflict cannot overwrite authentic success and only the original body retries', async () => {
+  const gateway = new FakeGateway();
+  const store = createMemoryOrderStore();
+  const referenceSecret = 'unit-test-signing-secret';
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    referenceSecret,
+    { store, referenceSecret },
+  );
+  const quoteToken = await getQuoteToken(app);
+  gateway.paymentError = new OpenBorderApiError(
+    'idempotency_key_conflict',
+    409,
+    'The idempotency key already has a different body',
+  );
+
+  const conflict = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(409);
+
+  assert.equal(conflict.body.code, 'idempotency_key_conflict');
+  assert.equal(conflict.body.outcomeUnknown, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+  assert.equal((await store.getUsage()).activeCheckout, true);
+
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'conflict-success-delivery',
+      paymentReferenceHash: createHmac('sha256', referenceSecret)
+        .update(paymentIntent.id)
+        .digest('hex'),
+      status: 'paid',
+      occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+    }),
+    'staged',
+  );
+
+  const changedRetry = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_changed' })
+    .expect(409);
+  assert.equal(changedRetry.body.code, 'checkout_retry_mismatch');
+  assert.equal(changedRetry.body.outcomeUnknown, true);
+  assert.equal(gateway.paymentCalls.length, 1);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+
+  gateway.paymentError = null;
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  assert.equal(gateway.paymentCalls.length, 2);
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal((await store.getUsage()).activeCheckout, false);
 });
 
 test('malformed JSON returns the normal safe validation envelope', async () => {

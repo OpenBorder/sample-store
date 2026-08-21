@@ -3,6 +3,7 @@ import type { RequestHandler } from 'express';
 import type { OrderStatus, OrderStore } from './order-store';
 
 const TOLERANCE_MS = 5 * 60 * 1000;
+const DELIVERY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const hashPrivateReference = (secret: string, value: string) =>
   createHmac('sha256', secret).update(value, 'utf8').digest('hex');
@@ -43,15 +44,27 @@ export function createWebhookReceiver(options: {
 
     const event = readTerminalEvent(rawBody);
     if (event) {
-      await options.store.applyWebhook({
-        deliveryHash: hashPrivateReference(options.referenceSecret, deliveryId),
-        paymentReferenceHash: hashPrivateReference(
-          options.referenceSecret,
-          event.paymentIntentId,
-        ),
-        status: event.orderStatus,
-        occurredAt: new Date(timestamp * 1000),
-      });
+      try {
+        await options.store.purgeDeliveriesBefore(
+          new Date(now() - DELIVERY_RETENTION_MS),
+        );
+        const result = await options.store.applyWebhook({
+          deliveryHash: hashPrivateReference(options.referenceSecret, deliveryId),
+          paymentReferenceHash: hashPrivateReference(
+            options.referenceSecret,
+            event.paymentIntentId,
+          ),
+          status: event.orderStatus,
+          occurredAt: event.occurredAt,
+        });
+        if (result === 'capacity_reached') {
+          res.status(503).json({ ok: false, code: 'webhook_retry' });
+          return;
+        }
+      } catch {
+        res.status(503).json({ ok: false, code: 'webhook_retry' });
+        return;
+      }
     }
     res.status(204).send();
   };
@@ -91,27 +104,33 @@ function validSignature(
 function readTerminalEvent(rawBody: Buffer): {
   paymentIntentId: string;
   orderStatus: Extract<OrderStatus, 'paid' | 'payment_failed'>;
+  occurredAt: Date;
 } | null {
   try {
     const event = JSON.parse(rawBody.toString('utf8')) as {
       type?: unknown;
       mode?: unknown;
-      data?: { paymentIntentId?: unknown };
+      occurredAt?: unknown;
+      data?: { paymentIntentId?: unknown; demoStore?: unknown };
     };
     if (event.mode !== 'test') return null;
+    if (event.data?.demoStore !== 'custom_api') return null;
     const paymentIntentId = event.data?.paymentIntentId;
     if (typeof paymentIntentId !== 'string' || !paymentIntentId) return null;
+    if (typeof event.occurredAt !== 'string') return null;
+    const occurredAt = new Date(event.occurredAt);
+    if (!Number.isFinite(occurredAt.getTime())) return null;
     if (
       event.type === 'payment_intent.succeeded' ||
       event.type === 'payment_intent.captured'
     ) {
-      return { paymentIntentId, orderStatus: 'paid' };
+      return { paymentIntentId, orderStatus: 'paid', occurredAt };
     }
     if (
       event.type === 'payment_intent.failed' ||
       event.type === 'payment_intent.canceled'
     ) {
-      return { paymentIntentId, orderStatus: 'payment_failed' };
+      return { paymentIntentId, orderStatus: 'payment_failed', occurredAt };
     }
     return null;
   } catch {
