@@ -560,6 +560,11 @@ test('a definitive payment decline closes the order and releases the active slot
     .expect(402);
 
   assert.equal(declined.body.code, 'payment_declined');
+  assert.equal(declined.body.checkoutClosed, true);
+  assert.equal(
+    declined.body.message,
+    'The test payment was declined. Close this checkout and start a new one with another test card.',
+  );
   assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_failed');
   assert.equal((await store.getUsage()).activeCheckout, false);
 
@@ -574,6 +579,49 @@ test('a definitive payment decline closes the order and releases the active slot
     .send({ ...nextInput, quoteToken: nextQuote, paymentMethodId: 'pm_test_4242' })
     .expect(200);
   assert.equal(gateway.paymentCalls.length, 2);
+});
+
+test('a failed definitive-state write requires an exact locked retry', async () => {
+  const gateway = new FakeGateway();
+  const durableStore = createMemoryOrderStore();
+  let failStateWrite = true;
+  const store = {
+    ...durableStore,
+    markPaymentFailed: async (retryCheckoutId: string) => {
+      if (failStateWrite) {
+        failStateWrite = false;
+        throw new Error('simulated_state_write_failure');
+      }
+      return durableStore.markPaymentFailed(retryCheckoutId);
+    },
+  };
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    { store },
+  );
+  const quoteToken = await getQuoteToken(app);
+  const chargeBody = { ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' };
+  gateway.paymentError = new OpenBorderApiError(
+    'payment_declined',
+    402,
+    'Unsafe provider detail must not escape',
+  );
+
+  const retryRequired = await request(app).post('/charge').send(chargeBody).expect(503);
+  assert.equal(retryRequired.body.code, 'checkout_state_retry_required');
+  assert.equal(retryRequired.body.retrySameCheckout, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+  assert.equal((await store.getUsage()).activeCheckout, true);
+
+  const declined = await request(app).post('/charge').send(chargeBody).expect(402);
+  assert.equal(declined.body.checkoutClosed, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_failed');
+  assert.equal((await store.getUsage()).activeCheckout, false);
+  assert.equal(gateway.paymentCalls.length, 2);
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+  assert.deepEqual(gateway.paymentCalls[0]?.input, gateway.paymentCalls[1]?.input);
 });
 
 test('an idempotency conflict cannot overwrite authentic success and only the original body retries', async () => {

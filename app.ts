@@ -222,14 +222,14 @@ const buyerFingerprintFor = (input: CheckoutInput) =>
 
 const providerMessage = (code: string) => {
   if (code === 'validation_error') return 'Check the checkout details and try again.';
-  if (code === 'payment_declined') return 'The test payment was declined. Try another test card.';
+  if (code === 'payment_declined') return 'The test payment was declined.';
   if (code === 'idempotency_key_conflict') {
     return 'Payment status is unknown. Retry only this locked checkout.';
   }
   return 'Open Border could not complete this test request. Please try again.';
 };
 
-const isDefinitivePaymentFailure = (error: unknown) =>
+const isDefinitivePaymentFailure = (error: unknown): error is OpenBorderApiError =>
   error instanceof OpenBorderApiError &&
   ['payment_declined', 'validation_error'].includes(error.code);
 
@@ -252,6 +252,29 @@ function sendPaymentOutcomeUnknown(res: Response, error: unknown): void {
     message: 'Payment status is unknown. Retry only this locked checkout.',
     outcomeUnknown: true,
     requestId,
+  });
+}
+
+function sendClosedCheckout(res: Response, error: OpenBorderApiError): void {
+  const message = error.code === 'payment_declined'
+    ? 'The test payment was declined. Close this checkout and start a new one with another test card.'
+    : 'The payment request was rejected. Close this checkout and start a new one.';
+  res.status(error.status >= 400 && error.status < 500 ? error.status : 502).json({
+    ok: false,
+    code: error.code,
+    message,
+    checkoutClosed: true,
+    requestId: res.locals.requestId,
+  });
+}
+
+function sendCheckoutStateRetryRequired(res: Response): void {
+  res.status(503).json({
+    ok: false,
+    code: 'checkout_state_retry_required',
+    message: 'The payment was declined, but the checkout could not be safely closed. Retry only this locked checkout.',
+    retrySameCheckout: true,
+    requestId: res.locals.requestId,
   });
 }
 
@@ -556,8 +579,14 @@ export function createApp(
         });
       } catch (error) {
         if (isDefinitivePaymentFailure(error)) {
-          await store.markPaymentFailed(input.checkoutId);
-          throw error;
+          try {
+            await store.markPaymentFailed(input.checkoutId);
+          } catch {
+            sendCheckoutStateRetryRequired(res);
+            return;
+          }
+          sendClosedCheckout(res, error);
+          return;
         }
         sendPaymentOutcomeUnknown(res, error);
         return;

@@ -25,7 +25,8 @@ const TRANSACTION_CAP_LOCK_KEY = 194_837_201;
 const PENDING_WEBHOOK_LOCK_KEY = 194_837_202;
 const PAYMENT_REFERENCE_LOCK_SEED = 645;
 const MAX_PENDING_WEBHOOKS = 8;
-const PENDING_WEBHOOK_RETENTION_MS = 15 * 60 * 1000;
+const PENDING_WEBHOOK_RETENTION_SECONDS = 15 * 60;
+const PENDING_WEBHOOK_RETENTION_MS = PENDING_WEBHOOK_RETENTION_SECONDS * 1000;
 
 export interface OrderStore {
   checkReady(): Promise<boolean>;
@@ -347,7 +348,7 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
         await transaction`
           DELETE FROM sample_store_pending_webhooks
           WHERE payment_reference_hash = ${paymentReferenceHash}
-            AND received_at < now() - interval '15 minutes'
+            AND received_at < now() - ${PENDING_WEBHOOK_RETENTION_SECONDS} * interval '1 second'
         `;
         const pending = await transaction<{
           deliveryHash: string;
@@ -427,7 +428,7 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
           await transaction`SELECT pg_advisory_xact_lock(${PENDING_WEBHOOK_LOCK_KEY})`;
           await transaction`
             DELETE FROM sample_store_pending_webhooks
-            WHERE received_at < now() - interval '15 minutes'
+            WHERE received_at < now() - ${PENDING_WEBHOOK_RETENTION_SECONDS} * interval '1 second'
           `;
           const ownership = await transaction<{ active: boolean; pending: number }[]>`
             SELECT

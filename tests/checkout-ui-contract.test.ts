@@ -253,3 +253,166 @@ test('an outcome-unknown charge keeps the original payment method for an exact r
   assert.equal(runtime.element('review-total').textContent, 'Order submitted');
   assert.equal(runtime.element('review-total').disabled, true);
 });
+
+test('a transient retry preflight keeps the original ambiguous payment method', async () => {
+  const source = await readFile(join(process.cwd(), 'public/checkout.js'), 'utf8');
+  const chargeBodies: Array<Record<string, unknown>> = [];
+  const runtime = createCheckoutRuntime(source, async (url, init) => {
+    if (url === '/quote') {
+      return {
+        json: async () => ({
+          ok: true,
+          domestic: false,
+          quoteToken: 'retry-preflight.browser-contract',
+          amount_breakdown: {
+            subtotal: 4200,
+            shipping: 0,
+            tax: 840,
+            duty: 210,
+            total: 5250,
+            currency: 'USD',
+          },
+        }),
+      };
+    }
+    assert.equal(url, '/charge');
+    chargeBodies.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
+    return {
+      json: async () => {
+        if (chargeBodies.length === 1) {
+          return {
+            ok: false,
+            code: 'payment_status_unknown',
+            outcomeUnknown: true,
+          };
+        }
+        if (chargeBodies.length === 2) {
+          return {
+            ok: false,
+            code: 'demo_not_ready',
+            message: 'The durable checkout store is temporarily unavailable.',
+          };
+        }
+        return { ok: true, status: 'payment_submitted' };
+      },
+    };
+  });
+
+  await openCompletedBuyerForm(runtime.element);
+  await runtime.element('review-total').dispatch('click');
+  const payment = runtime.mountedPayment();
+  await assert.rejects(
+    payment.onSuccess({ paymentMethodId: 'pm_original_browser_contract' }),
+    /payment_status_unknown/,
+  );
+  await assert.rejects(
+    payment.onSuccess({ paymentMethodId: 'pm_changed_after_preflight' }),
+    /payment_status_unknown/,
+  );
+  await payment.onSuccess({ paymentMethodId: 'pm_changed_after_recovery' });
+
+  assert.equal(chargeBodies.length, 3);
+  assert.equal(chargeBodies[0]?.paymentMethodId, 'pm_original_browser_contract');
+  assert.equal(chargeBodies[1]?.paymentMethodId, 'pm_original_browser_contract');
+  assert.equal(chargeBodies[2]?.paymentMethodId, 'pm_original_browser_contract');
+});
+
+test('a terminal decline locks the closed checkout and requires a new session', async () => {
+  const source = await readFile(join(process.cwd(), 'public/checkout.js'), 'utf8');
+  const runtime = createCheckoutRuntime(source, async (url) => {
+    if (url === '/quote') {
+      return {
+        json: async () => ({
+          ok: true,
+          domestic: false,
+          quoteToken: 'declined.browser-contract',
+          amount_breakdown: {
+            subtotal: 4200,
+            shipping: 0,
+            tax: 840,
+            duty: 210,
+            total: 5250,
+            currency: 'USD',
+          },
+        }),
+      };
+    }
+    assert.equal(url, '/charge');
+    return {
+      json: async () => ({
+        ok: false,
+        code: 'payment_declined',
+        checkoutClosed: true,
+        message: 'The test payment was declined. Close this checkout and start a new one.',
+      }),
+    };
+  });
+
+  await openCompletedBuyerForm(runtime.element);
+  await runtime.element('review-total').dispatch('click');
+  await assert.rejects(
+    runtime.mountedPayment().onSuccess({ paymentMethodId: 'pm_declined_browser_contract' }),
+    /checkout_closed/,
+  );
+
+  assert.equal(runtime.element('review-total').textContent, 'Checkout closed — close and restart');
+  assert.equal(runtime.element('review-total').disabled, true);
+  assert.equal(runtime.element('email').disabled, true);
+});
+
+test('a retry-required state write keeps the original payment method until closure', async () => {
+  const source = await readFile(join(process.cwd(), 'public/checkout.js'), 'utf8');
+  const chargeBodies: Array<Record<string, unknown>> = [];
+  const runtime = createCheckoutRuntime(source, async (url, init) => {
+    if (url === '/quote') {
+      return {
+        json: async () => ({
+          ok: true,
+          domestic: false,
+          quoteToken: 'state-retry.browser-contract',
+          amount_breakdown: {
+            subtotal: 4200,
+            shipping: 0,
+            tax: 840,
+            duty: 210,
+            total: 5250,
+            currency: 'USD',
+          },
+        }),
+      };
+    }
+    assert.equal(url, '/charge');
+    chargeBodies.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
+    return {
+      json: async () => chargeBodies.length === 1
+        ? {
+            ok: false,
+            code: 'checkout_state_retry_required',
+            retrySameCheckout: true,
+          }
+        : {
+            ok: false,
+            code: 'payment_declined',
+            checkoutClosed: true,
+            message: 'The test payment was declined. Close this checkout and start a new one.',
+          },
+    };
+  });
+
+  await openCompletedBuyerForm(runtime.element);
+  await runtime.element('review-total').dispatch('click');
+  const payment = runtime.mountedPayment();
+  await assert.rejects(
+    payment.onSuccess({ paymentMethodId: 'pm_original_state_retry' }),
+    /checkout_retry_required/,
+  );
+  await assert.rejects(
+    payment.onSuccess({ paymentMethodId: 'pm_changed_state_retry' }),
+    /checkout_closed/,
+  );
+
+  assert.equal(chargeBodies.length, 2);
+  assert.equal(chargeBodies[0]?.paymentMethodId, 'pm_original_state_retry');
+  assert.equal(chargeBodies[1]?.paymentMethodId, 'pm_original_state_retry');
+  assert.equal(runtime.element('review-total').textContent, 'Checkout closed — close and restart');
+});

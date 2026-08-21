@@ -12,7 +12,7 @@ This repository is a public test-mode reference application.
 - Displayed quotes are signed and bound to one checkout before payment creation.
 - Orders and HMAC-bound stable idempotency keys are durably persisted before payment creation.
   The key fingerprints the exact provider submission, so a changed retry is rejected before
-  provider I/O and an ambiguous provider response remains nonterminal for authentic reconciliation.
+  payment-intent I/O and an ambiguous provider response remains nonterminal for authentic reconciliation.
 - Provider and webhook delivery references are stored only as keyed hashes.
 - Terminal order state changes require a timestamped, authentic raw-body webhook whose signed
   event declares Test mode and trusted `custom_api` provenance. Duplicate deliveries are durably

@@ -389,15 +389,18 @@ function mountEmbed() {
       renderReceipt('pending', 'Processing your payment…');
       const retryPaymentMethodId = state.retryPaymentMethodId || paymentMethodId;
       state.retryPaymentMethodId = retryPaymentMethodId;
-      const lockUnknownOutcome = () => {
+      const lockSafeRetry = (
+        title = 'Payment status unknown',
+        message = 'The request may have completed. Keep this checkout and press Pay again to safely reuse the same reference.',
+      ) => {
         state.ambiguousRetry = true;
         state.ambiguousProductId = product.id;
         setCheckoutLocked(true);
         setQuoteAction('Quote locked for safe retry', true);
         renderReceipt(
           'pending',
-          '<h4>Payment status unknown</h4>' +
-            '<p>The request may have completed. Keep this checkout and press Pay again to safely reuse the same reference.</p>' +
+          `<h4>${escapeHtml(title)}</h4>` +
+            `<p>${escapeHtml(message)}</p>` +
             `<p class="request-ref">Retry-safe checkout ${escapeHtml(state.checkoutId.slice(0, 8))}</p>`,
         );
       };
@@ -418,12 +421,33 @@ function mountEmbed() {
         });
         data = await res.json();
       } catch {
-        lockUnknownOutcome();
+        lockSafeRetry();
         throw new Error('payment_status_unknown');
       }
       if (!data.ok) {
-        if (data.outcomeUnknown) {
-          lockUnknownOutcome();
+        if (data.checkoutClosed) {
+          state.ambiguousRetry = false;
+          state.ambiguousProductId = null;
+          state.retryPaymentMethodId = null;
+          setCheckoutLocked(true);
+          setQuoteAction('Checkout closed — close and restart', true);
+          renderPaymentPlaceholder('This checkout is closed. Close it and start a new checkout.');
+          renderReceipt(
+            'err',
+            `<h4>Payment failed</h4><p>${escapeHtml(data.code)}: ${escapeHtml(data.message)}</p>` +
+              `<p class="request-ref">Request ${escapeHtml(data.requestId || 'unavailable')}</p>`,
+          );
+          throw new Error('checkout_closed');
+        }
+        if (data.retrySameCheckout) {
+          lockSafeRetry(
+            'Checkout retry required',
+            data.message || 'Retry only this locked checkout so its durable state can be reconciled.',
+          );
+          throw new Error('checkout_retry_required');
+        }
+        if (data.outcomeUnknown || state.ambiguousRetry) {
+          lockSafeRetry();
           throw new Error('payment_status_unknown');
         }
         state.ambiguousRetry = false;
