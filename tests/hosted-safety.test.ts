@@ -329,6 +329,34 @@ test('unknown signed events are staged only inside one bounded active-checkout w
   );
 });
 
+test('reference attachment never consumes pending webhook evidence after its 15-minute window', async () => {
+  let now = new Date('2026-08-21T13:00:00.000Z');
+  const store = createMemoryOrderStore({ now: () => now });
+  await store.createOrGetWithinCap(
+    {
+      checkoutId,
+      idempotencyKey: 'stable-key',
+      status: 'awaiting_payment',
+      productId: 'hoodie',
+      amount: 3400,
+      currency: 'GBP',
+    },
+    50,
+  );
+  await store.applyWebhook({
+    deliveryHash: 'expired_delivery',
+    paymentReferenceHash: 'expired_reference',
+    status: 'paid',
+    occurredAt: now,
+  });
+
+  now = new Date(now.getTime() + 16 * 60 * 1000);
+  await store.attachPaymentReference(checkoutId, 'expired_reference');
+
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_submitted');
+  assert.equal(store.deliveryCount(), 0);
+});
+
 test('terminal orders cannot regress on retry or a contradictory delivery', async () => {
   const store = createMemoryOrderStore();
   const paymentReferenceHash = 'private_payment_hash';

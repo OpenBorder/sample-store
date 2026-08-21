@@ -132,6 +132,13 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 6. After a separately approved activation, set `DEMO_TRANSACTION_CAP=50`; never reset the daily
    count or bypass an unresolved checkout to finish a demo.
 
+For an upgrade of the maintained `sample-store-ten.vercel.app` production demo, the approved cap
+is already `50`. Preserve that value throughout the upgrade; do not use the fresh-install cap-zero
+transition above. Immediately before and after applying only the new migration and deploying the
+approved commit, record the UTC-day usage and confirm there is no active checkout. Abort on any
+drift. Changing the cap, creating a quote, or starting a checkout requires its own explicit
+approval.
+
 The hosted runtime accepts Test keys only and pins `OB_API_URL` to
 `https://api-sandbox.openborderpayments.com`. With `DEMO_TRANSACTION_CAP=0`, transaction routes
 remain closed while `/health` can independently prove durable-order, authentic-webhook, and

@@ -121,6 +121,10 @@ export function createMemoryOrderStore(
       paymentReferences.set(paymentReferenceHash, checkoutId);
       if (isTerminal(order.status)) return 'terminal_noop';
       orders.set(checkoutId, { ...order, status: 'payment_submitted' });
+      const pendingCutoff = new Date(now().getTime() - PENDING_WEBHOOK_RETENTION_MS);
+      for (const [deliveryHash, delivery] of pendingDeliveries) {
+        if (delivery.receivedAt < pendingCutoff) pendingDeliveries.delete(deliveryHash);
+      }
       const pending = [...pendingDeliveries.entries()]
         .filter(([, delivery]) => delivery.paymentReferenceHash === paymentReferenceHash)
         .sort((left, right) => {
@@ -340,6 +344,11 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
             WHERE checkout_id = ${checkoutId}
           `;
         }
+        await transaction`
+          DELETE FROM sample_store_pending_webhooks
+          WHERE payment_reference_hash = ${paymentReferenceHash}
+            AND received_at < now() - interval '15 minutes'
+        `;
         const pending = await transaction<{
           deliveryHash: string;
           status: Extract<OrderStatus, 'paid' | 'payment_failed'>;

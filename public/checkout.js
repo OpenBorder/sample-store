@@ -80,6 +80,12 @@ function setCheckoutLocked(locked) {
   }
 }
 
+function setQuoteAction(label, disabled = false) {
+  const action = $('review-total');
+  action.textContent = label;
+  action.disabled = disabled;
+}
+
 
 const ob = OB_CONFIG.transactionsEnabled
   ? OpenBorder(OB_CONFIG.publishableKey, { apiBaseUrl: OB_CONFIG.apiBaseUrl })
@@ -225,8 +231,8 @@ function renderOrderSummary() {
   receiptCard.hidden = true;
 }
 
-// Pre-payment quote: duties & taxes for the current product + currency + ship-to address.
-// The seq guard drops stale responses when the buyer changes currency/address mid-flight.
+// Pre-payment quote: exactly one explicit request after the buyer finalizes every bound field.
+// The seq guard still drops a response if the drawer closes while that request is in flight.
 let quoteSeq = 0;
 async function refreshQuote() {
   const product = state.product;
@@ -273,12 +279,39 @@ async function refreshQuote() {
   }
 }
 
-// Quote first, then (re-)mount the embed so the Pay button shows the full quoted total.
 function updateDrawer() {
   renderOrderSummary();
-  refreshQuote().then((quoted) => {
-    if (quoted && drawer.classList.contains('open') && state.product) mountEmbed();
-  });
+  renderTotals(null, 'Enter the final buyer details, then request one landed-cost quote.');
+  renderPaymentPlaceholder('Review the final order total before entering payment details.');
+  setQuoteAction(ob ? 'Review order total' : 'Checkout unavailable', !ob);
+}
+
+function validateBuyerDetails() {
+  for (const id of ['email', 'name', 'line1', 'city', 'postal_code', 'country']) {
+    const field = $(id);
+    if (!field.checkValidity()) {
+      field.reportValidity();
+      return false;
+    }
+  }
+  return true;
+}
+
+async function reviewOrderTotal() {
+  if (!drawer.classList.contains('open') || !state.product || state.ambiguousRetry) return;
+  if (state.quoteToken) return;
+  if (!validateBuyerDetails()) return;
+
+  setQuoteAction('Calculating final total…', true);
+  const quoted = await refreshQuote();
+  if (!drawer.classList.contains('open') || !state.product) return;
+  if (!quoted) {
+    setQuoteAction('Quote unavailable — close and restart', true);
+    return;
+  }
+  setCheckoutLocked(true);
+  setQuoteAction('Final total locked', true);
+  mountEmbed();
 }
 
 function mountEmbed() {
@@ -341,6 +374,7 @@ function mountEmbed() {
         state.ambiguousRetry = true;
         state.ambiguousProductId = product.id;
         setCheckoutLocked(true);
+        setQuoteAction('Quote locked for safe retry', true);
         renderReceipt(
           'pending',
           '<h4>Payment status unknown</h4>' +
@@ -362,7 +396,8 @@ function mountEmbed() {
       }
       state.ambiguousRetry = false;
       state.ambiguousProductId = null;
-      setCheckoutLocked(false);
+      setCheckoutLocked(true);
+      setQuoteAction('Order submitted', true);
       const b = state.breakdown;
       renderReceipt(
         'pending',
@@ -414,6 +449,7 @@ function openCheckout() {
     }
     renderTotals(state.breakdown, 'Retrying the same signed quote and checkout reference.');
     setCheckoutLocked(true);
+    setQuoteAction('Quote locked for safe retry', true);
     mountEmbed();
     renderReceipt(
       'pending',
@@ -448,18 +484,17 @@ $('crumb-shop').addEventListener('click', goHome);
 $('hero-cta').addEventListener('click', () => document.getElementById('shop').scrollIntoView());
 for (const el of document.querySelectorAll('[data-nav-home]')) el.addEventListener('click', goHome);
 
-// A new ship-to country / postal code changes the duty & tax quote.
-function onAddressChange() {
+// Editing buyer-bound fields invalidates local state but performs no provider/API request.
+function onBuyerDetailChange() {
   if (!drawer.classList.contains('open') || !state.product) return;
   if (state.ambiguousRetry) return;
   resetCheckout();
-  refreshQuote().then((quoted) => {
-    if (quoted && drawer.classList.contains('open') && state.product) mountEmbed();
-  });
+  updateDrawer();
 }
-$('country').addEventListener('change', onAddressChange);
-$('postal_code').addEventListener('change', onAddressChange);
-for (const id of ['email', 'name', 'line1', 'city']) $(id).addEventListener('change', onAddressChange);
+for (const id of ['email', 'name', 'line1', 'city', 'postal_code', 'country']) {
+  $(id).addEventListener('change', onBuyerDetailChange);
+}
+$('review-total').addEventListener('click', reviewOrderTotal);
 
 $('drawer-close').addEventListener('click', closeCheckout);
 overlay.addEventListener('click', closeCheckout);

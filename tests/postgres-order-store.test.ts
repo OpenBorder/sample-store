@@ -93,6 +93,38 @@ test(
       assert.equal((await store.getByCheckoutId(accepted.checkoutId))?.status, 'paid');
 
       await sql`TRUNCATE sample_store_pending_webhooks, sample_store_webhook_deliveries, sample_store_orders`;
+      const expiredCheckoutId = '30000000-0000-4000-8000-000000000001';
+      await store.createOrGetWithinCap(
+        {
+          checkoutId: expiredCheckoutId,
+          idempotencyKey: 'expired-race-key',
+          status: 'awaiting_payment',
+          productId: 'hoodie',
+          amount: 3400,
+          currency: 'GBP',
+        },
+        50,
+      );
+      await store.applyWebhook({
+        deliveryHash: 'expired-private-delivery-hash',
+        paymentReferenceHash: 'expired-private-reference-hash',
+        status: 'paid',
+        occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+      });
+      await sql`
+        UPDATE sample_store_pending_webhooks
+        SET received_at = now() - interval '16 minutes'
+      `;
+      await store.attachPaymentReference(expiredCheckoutId, 'expired-private-reference-hash');
+      assert.equal((await store.getByCheckoutId(expiredCheckoutId))?.status, 'payment_submitted');
+      const expiredAggregates = await sql<{ deliveries: number; pending: number }[]>`
+        SELECT
+          (SELECT count(*)::int FROM sample_store_webhook_deliveries) AS deliveries,
+          (SELECT count(*)::int FROM sample_store_pending_webhooks) AS pending
+      `;
+      assert.deepEqual(expiredAggregates[0], { deliveries: 0, pending: 0 });
+
+      await sql`TRUNCATE sample_store_pending_webhooks, sample_store_webhook_deliveries, sample_store_orders`;
       let lastRaceCheckoutId = '';
       for (let index = 1; index <= 25; index += 1) {
         const raceCheckoutId = `20000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
