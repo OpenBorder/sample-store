@@ -223,13 +223,37 @@ const buyerFingerprintFor = (input: CheckoutInput) =>
 const providerMessage = (code: string) => {
   if (code === 'validation_error') return 'Check the checkout details and try again.';
   if (code === 'payment_declined') return 'The test payment was declined. Try another test card.';
-  if (code === 'idempotency_conflict') return 'This checkout changed after submission. Start a new checkout.';
+  if (code === 'idempotency_key_conflict') {
+    return 'Payment status is unknown. Retry only this locked checkout.';
+  }
   return 'Open Border could not complete this test request. Please try again.';
 };
 
 const isDefinitivePaymentFailure = (error: unknown) =>
   error instanceof OpenBorderApiError &&
-  ['payment_declined', 'validation_error', 'idempotency_key_conflict'].includes(error.code);
+  ['payment_declined', 'validation_error'].includes(error.code);
+
+function sendPaymentOutcomeUnknown(res: Response, error: unknown): void {
+  const requestId = res.locals.requestId as string | undefined;
+  if (error instanceof OpenBorderApiError) {
+    const status = error.status >= 400 && error.status < 500 ? error.status : 502;
+    res.status(status).json({
+      ok: false,
+      code: error.code,
+      message: providerMessage(error.code),
+      outcomeUnknown: true,
+      requestId,
+    });
+    return;
+  }
+  res.status(502).json({
+    ok: false,
+    code: 'payment_status_unknown',
+    message: 'Payment status is unknown. Retry only this locked checkout.',
+    outcomeUnknown: true,
+    requestId,
+  });
+}
 
 async function hasTrustedCustomApiProvenance(
   client: OpenBorderGateway,
@@ -256,6 +280,16 @@ function sendError(res: Response, error: unknown) {
   const requestId = res.locals.requestId as string | undefined;
   if (error instanceof RequestValidationError) {
     res.status(400).json({ ok: false, code: 'validation_error', message: error.message, fields: error.fields, requestId });
+    return;
+  }
+  if (error instanceof Error && error.message === 'order_reference_conflict') {
+    res.status(409).json({
+      ok: false,
+      code: 'checkout_retry_mismatch',
+      message: 'This request does not match the locked checkout. Retry only the original payment.',
+      outcomeUnknown: true,
+      requestId,
+    });
     return;
   }
   if (error instanceof OpenBorderApiError) {
@@ -460,9 +494,24 @@ export function createApp(
         sendDemoProvenanceUnavailable(res);
         return;
       }
+      const paymentInput: CreatePaymentIntentInput = {
+        tax_quote_id: quote.taxQuoteId,
+        amount: input.amount,
+        currency: input.currency,
+        payment_method: input.paymentMethodId,
+        customer: { email: input.email!, ...(input.name ? { name: input.name } : {}) },
+        billing_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
+        shipping_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
+        line_items: lineItemsFor(input, quote.normalizedHsCode),
+        merchant_reference: `sample-store-${input.checkoutId}`,
+        metadata: { demo: 'custom-api-reference', checkout_id: input.checkoutId },
+      };
       const order = await store.createOrGetWithinCap({
         checkoutId: input.checkoutId,
-        idempotencyKey: randomUUID(),
+        idempotencyKey: hashPrivateReference(
+          referenceSecret,
+          `payment-submission\0${JSON.stringify(paymentInput)}`,
+        ),
         status: 'awaiting_payment',
         productId: input.productId,
         amount: input.amount,
@@ -499,18 +548,6 @@ export function createApp(
         });
         return;
       }
-      const paymentInput: CreatePaymentIntentInput = {
-        tax_quote_id: quote.taxQuoteId,
-        amount: input.amount,
-        currency: input.currency,
-        payment_method: input.paymentMethodId,
-        customer: { email: input.email!, ...(input.name ? { name: input.name } : {}) },
-        billing_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
-        shipping_address: input.address as Required<Pick<AddressInput, 'line1' | 'country'>> & AddressInput,
-        line_items: lineItemsFor(input, quote.normalizedHsCode),
-        merchant_reference: `sample-store-${input.checkoutId}`,
-        metadata: { demo: 'custom-api-reference', checkout_id: input.checkoutId },
-      };
 
       let paymentIntent: PaymentIntentResponse;
       try {
@@ -520,8 +557,10 @@ export function createApp(
       } catch (error) {
         if (isDefinitivePaymentFailure(error)) {
           await store.markPaymentFailed(input.checkoutId);
+          throw error;
         }
-        throw error;
+        sendPaymentOutcomeUnknown(res, error);
+        return;
       }
       await store.attachPaymentReference(
         input.checkoutId,

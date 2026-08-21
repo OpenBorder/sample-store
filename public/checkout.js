@@ -43,14 +43,17 @@ const $ = (id) => document.getElementById(id);
 const price = (amount, currency) =>
   new Intl.NumberFormat('en', { style: 'currency', currency }).format(amount / 100);
 
+let quoteSeq = 0;
 const state = {
   currency: 'USD',
   product: null,
   breakdown: null,
   checkoutId: crypto.randomUUID(),
   quoteToken: null,
+  quoteAttempted: false,
   ambiguousRetry: false,
   ambiguousProductId: null,
+  retryPaymentMethodId: null,
 };
 
 const overlay = $('overlay');
@@ -66,16 +69,29 @@ const escapeHtml = (value) =>
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
 
-function resetCheckout() {
+function resetCheckout(startNewSession = false) {
+  quoteSeq += 1;
   state.checkoutId = crypto.randomUUID();
   state.quoteToken = null;
   state.breakdown = null;
   state.ambiguousRetry = false;
   state.ambiguousProductId = null;
+  state.retryPaymentMethodId = null;
+  if (startNewSession) state.quoteAttempted = false;
 }
 
 function setCheckoutLocked(locked) {
-  for (const id of ['email', 'name', 'line1', 'city', 'postal_code', 'country', 'drawer-ccy']) {
+  for (const id of [
+    'email',
+    'name',
+    'line1',
+    'city',
+    'postal_code',
+    'country',
+    'nav-ccy',
+    'pdp-ccy',
+    'drawer-ccy',
+  ]) {
     $(id).disabled = locked;
   }
 }
@@ -196,8 +212,7 @@ function setCurrency(ccy) {
   // A currency change while the drawer is open must reload the payment element on the new
   // entity's account — the embed takes `currency` at mount, so re-mount it.
   if (drawer.classList.contains('open') && state.product) {
-    resetCheckout();
-    updateDrawer();
+    resetForBoundChange();
   }
 }
 
@@ -232,8 +247,7 @@ function renderOrderSummary() {
 }
 
 // Pre-payment quote: exactly one explicit request after the buyer finalizes every bound field.
-// The seq guard still drops a response if the drawer closes while that request is in flight.
-let quoteSeq = 0;
+// The seq guard drops a response if the checkout is reset while that request is in flight.
 async function refreshQuote() {
   const product = state.product;
   const ccy = state.currency;
@@ -286,6 +300,18 @@ function updateDrawer() {
   setQuoteAction(ob ? 'Review order total' : 'Checkout unavailable', !ob);
 }
 
+function resetForBoundChange() {
+  const quoteWasAttempted = state.quoteAttempted;
+  resetCheckout();
+  setCheckoutLocked(quoteWasAttempted);
+  updateDrawer();
+  if (quoteWasAttempted) {
+    renderTotals(null, 'The in-flight quote was invalidated. Close and restart this checkout.');
+    renderPaymentPlaceholder('Payment is unavailable for an invalidated quote.');
+    setQuoteAction('Quote invalidated — close and restart', true);
+  }
+}
+
 function validateBuyerDetails() {
   for (const id of ['email', 'name', 'line1', 'city', 'postal_code', 'country']) {
     const field = $(id);
@@ -299,12 +325,19 @@ function validateBuyerDetails() {
 
 async function reviewOrderTotal() {
   if (!drawer.classList.contains('open') || !state.product || state.ambiguousRetry) return;
-  if (state.quoteToken) return;
+  if (state.quoteAttempted || state.quoteToken) return;
   if (!validateBuyerDetails()) return;
 
+  state.quoteAttempted = true;
+  const checkoutId = state.checkoutId;
+  setCheckoutLocked(true);
   setQuoteAction('Calculating final total…', true);
   const quoted = await refreshQuote();
-  if (!drawer.classList.contains('open') || !state.product) return;
+  if (
+    !drawer.classList.contains('open') ||
+    !state.product ||
+    state.checkoutId !== checkoutId
+  ) return;
   if (!quoted) {
     setQuoteAction('Quote unavailable — close and restart', true);
     return;
@@ -354,23 +387,9 @@ function mountEmbed() {
         throw new Error('quote_missing');
       }
       renderReceipt('pending', 'Processing your payment…');
-      let data;
-      try {
-        const res = await fetch('/charge', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            checkoutId: state.checkoutId,
-            quoteToken: state.quoteToken,
-            paymentMethodId,
-            productId: product.id,
-            currency: ccy,
-            amount,
-            ...details,
-          }),
-        });
-        data = await res.json();
-      } catch {
+      const retryPaymentMethodId = state.retryPaymentMethodId || paymentMethodId;
+      state.retryPaymentMethodId = retryPaymentMethodId;
+      const lockUnknownOutcome = () => {
         state.ambiguousRetry = true;
         state.ambiguousProductId = product.id;
         setCheckoutLocked(true);
@@ -381,11 +400,35 @@ function mountEmbed() {
             '<p>The request may have completed. Keep this checkout and press Pay again to safely reuse the same reference.</p>' +
             `<p class="request-ref">Retry-safe checkout ${escapeHtml(state.checkoutId.slice(0, 8))}</p>`,
         );
+      };
+      let data;
+      try {
+        const res = await fetch('/charge', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            checkoutId: state.checkoutId,
+            quoteToken: state.quoteToken,
+            paymentMethodId: retryPaymentMethodId,
+            productId: product.id,
+            currency: ccy,
+            amount,
+            ...details,
+          }),
+        });
+        data = await res.json();
+      } catch {
+        lockUnknownOutcome();
         throw new Error('payment_status_unknown');
       }
       if (!data.ok) {
+        if (data.outcomeUnknown) {
+          lockUnknownOutcome();
+          throw new Error('payment_status_unknown');
+        }
         state.ambiguousRetry = false;
         state.ambiguousProductId = null;
+        state.retryPaymentMethodId = null;
         setCheckoutLocked(false);
         renderReceipt(
           'err',
@@ -396,6 +439,7 @@ function mountEmbed() {
       }
       state.ambiguousRetry = false;
       state.ambiguousProductId = null;
+      state.retryPaymentMethodId = null;
       setCheckoutLocked(true);
       setQuoteAction('Order submitted', true);
       const b = state.breakdown;
@@ -459,7 +503,7 @@ function openCheckout() {
     );
     return;
   }
-  resetCheckout();
+  resetCheckout(true);
   setCheckoutLocked(false);
   updateDrawer();
 }
@@ -488,8 +532,7 @@ for (const el of document.querySelectorAll('[data-nav-home]')) el.addEventListen
 function onBuyerDetailChange() {
   if (!drawer.classList.contains('open') || !state.product) return;
   if (state.ambiguousRetry) return;
-  resetCheckout();
-  updateDrawer();
+  resetForBoundChange();
 }
 for (const id of ['email', 'name', 'line1', 'city', 'postal_code', 'country']) {
   $(id).addEventListener('change', onBuyerDetailChange);

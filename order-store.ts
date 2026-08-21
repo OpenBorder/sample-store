@@ -529,6 +529,7 @@ async function getOrder(sql: Sql, checkoutId: string): Promise<StoredOrder | und
 
 function assertSameOrder(existing: StoredOrder, requested: StoredOrder) {
   if (
+    existing.idempotencyKey !== requested.idempotencyKey ||
     existing.productId !== requested.productId ||
     existing.amount !== requested.amount ||
     existing.currency !== requested.currency

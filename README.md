@@ -135,10 +135,18 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 
 For an upgrade of the maintained `sample-store-ten.vercel.app` production demo, the approved cap
 is already `50`. Preserve that value throughout the upgrade; do not use the fresh-install cap-zero
-transition above. Immediately before and after applying only the new migration and deploying the
-approved commit, record the UTC-day usage and confirm there is no active checkout. Abort on any
-drift. Changing the cap, creating a quote, or starting a checkout requires its own explicit
-approval.
+transition above. Before migration or deployment, separately approve and enable a reversible edge
+maintenance rule that blocks only `POST /quote` and `POST /charge`, while leaving static/health GETs
+and `POST /webhooks/openborder` reachable. Verify both transaction routes fail closed without
+provider I/O, then record the UTC-day usage, active-checkout state, and pending-webhook count.
+
+Apply only `migrations/003_webhook_reconciliation.sql`; it is transaction-wrapped and must run with
+stop-on-error. Deploy the exact approved commit while the edge block remains enabled. Recheck the
+same aggregates and every readiness boolean before lifting the block under a separate approval.
+If any usage, active-checkout, or pending evidence drifts, keep new admissions blocked and
+reconcile on the new code. Roll application code back only when no checkout or pending evidence is
+active, and leave the additive migration installed. Changing the cap, creating a quote, starting a
+checkout, or replaying a webhook requires its own explicit approval.
 
 The hosted runtime accepts Test keys only and pins `OB_API_URL` to
 `https://api-sandbox.openborderpayments.com`. With `DEMO_TRANSACTION_CAP=0`, transaction routes

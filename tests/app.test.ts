@@ -214,7 +214,7 @@ test('the displayed signed quote is charged with a stable retry key', async () =
   assert.equal(first.body.status, 'payment_submitted');
   assert.equal(replay.body.status, 'payment_submitted');
   assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
-  assert.match(gateway.paymentCalls[0]?.key ?? '', /^[0-9a-f-]{36}$/);
+  assert.match(gateway.paymentCalls[0]?.key ?? '', /^[0-9a-f]{64}$/);
   assert.doesNotMatch(JSON.stringify(first.body), /pi_test_123|obmor_uk/);
   assert.equal(gateway.paymentCalls[0]?.input.tax_quote_id, 'tq_test_123');
   assert.equal(gateway.paymentCalls[0]?.input.amount, 3400);
@@ -474,6 +474,7 @@ test('provider errors return stable safe text and a request id', async () => {
     .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
     .expect(502);
   assert.equal(response.body.code, 'provider_unavailable');
+  assert.equal(response.body.outcomeUnknown, true);
   assert.equal(response.body.message, 'Open Border could not complete this test request. Please try again.');
   assert.doesNotMatch(JSON.stringify(response.body), /acct_secret|raw response/);
   assert.match(response.body.requestId, /^[0-9a-f-]{36}$/);
@@ -525,14 +526,15 @@ test('a definitive payment decline closes the order and releases the active slot
   assert.equal(gateway.paymentCalls.length, 2);
 });
 
-test('an idempotency-key conflict closes the changed checkout instead of wedging it', async () => {
+test('an idempotency conflict cannot overwrite authentic success and only the original body retries', async () => {
   const gateway = new FakeGateway();
   const store = createMemoryOrderStore();
+  const referenceSecret = 'unit-test-signing-secret';
   const app = createApp(
     { publishableKey: 'pk_test_public_example', transactionCap: 50 },
     gateway,
-    'unit-test-signing-secret',
-    { store },
+    referenceSecret,
+    { store, referenceSecret },
   );
   const quoteToken = await getQuoteToken(app);
   gateway.paymentError = new OpenBorderApiError(
@@ -547,7 +549,40 @@ test('an idempotency-key conflict closes the changed checkout instead of wedging
     .expect(409);
 
   assert.equal(conflict.body.code, 'idempotency_key_conflict');
-  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_failed');
+  assert.equal(conflict.body.outcomeUnknown, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+  assert.equal((await store.getUsage()).activeCheckout, true);
+
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'conflict-success-delivery',
+      paymentReferenceHash: createHmac('sha256', referenceSecret)
+        .update(paymentIntent.id)
+        .digest('hex'),
+      status: 'paid',
+      occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+    }),
+    'staged',
+  );
+
+  const changedRetry = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_changed' })
+    .expect(409);
+  assert.equal(changedRetry.body.code, 'checkout_retry_mismatch');
+  assert.equal(changedRetry.body.outcomeUnknown, true);
+  assert.equal(gateway.paymentCalls.length, 1);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+
+  gateway.paymentError = null;
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  assert.equal(gateway.paymentCalls.length, 2);
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
   assert.equal((await store.getUsage()).activeCheckout, false);
 });
 

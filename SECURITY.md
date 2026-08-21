@@ -10,7 +10,9 @@ This repository is a public test-mode reference application.
 - The secret key stays server-side; only the publishable key is returned to the browser.
 - Public product prices and tariff codes are resolved against the server catalog.
 - Displayed quotes are signed and bound to one checkout before payment creation.
-- Orders and stable idempotency keys are durably persisted before payment creation.
+- Orders and HMAC-bound stable idempotency keys are durably persisted before payment creation.
+  The key fingerprints the exact provider submission, so a changed retry is rejected before
+  provider I/O and an ambiguous provider response remains nonterminal for authentic reconciliation.
 - Provider and webhook delivery references are stored only as keyed hashes.
 - Terminal order state changes require a timestamped, authentic raw-body webhook whose signed
   event declares Test mode and trusted `custom_api` provenance. Duplicate deliveries are durably
@@ -22,6 +24,9 @@ This repository is a public test-mode reference application.
   time is retained separately only while an early delivery is pending.
 - Public deployments should also enforce a platform-level rate limit because serverless instances
   do not share in-memory counters.
+- Cap-preserving upgrades require an edge maintenance rule that blocks only transaction POSTs
+  while keeping authentic webhooks reachable until migration, deployment, and aggregate checks
+  finish.
 
 Report security concerns privately to the Open Border engineering team. Do not include keys,
 customer information, or exploitable payment details in a public issue.

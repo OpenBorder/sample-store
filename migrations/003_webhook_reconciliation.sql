@@ -1,3 +1,5 @@
+BEGIN;
+
 CREATE TABLE sample_store_pending_webhooks (
   delivery_hash text PRIMARY KEY,
   payment_reference_hash text NOT NULL,
@@ -13,3 +15,5 @@ CREATE INDEX sample_store_pending_webhooks_reference_idx
 
 CREATE INDEX sample_store_pending_webhooks_retention_idx
   ON sample_store_pending_webhooks (received_at);
+
+COMMIT;
