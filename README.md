@@ -70,12 +70,13 @@ npm start               # http://localhost:4000
 
 Open the store, pick a **currency** in the top bar (the price and settlement region change
 with it), open a product, and click **Add to bag**. In the checkout drawer, fill in the buyer
-details — the **Order total** quotes duties & taxes for the ship-to address before payment, and
-changing the country or postal code refreshes it. The ships-from origin is the US, so a US
-address is domestic and shows no duties/taxes; pick e.g. United Kingdom or Canada to see them.
-Only after the separate provider-delivery approval, complete the approved synthetic Sandbox
-checkout. The receipt shows the commercial breakdown and retry-safe checkout reference without
-exposing provider or routing identifiers.
+details, then click **Review order total** exactly once to quote duties and taxes. Buyer or currency
+changes before that action only reset local state; after a successful quote, the final fields and
+total remain locked for that checkout. The ships-from origin is the US, so a US address is domestic
+and shows no duties/taxes; pick e.g. United Kingdom or Canada to see them. Only after the separate
+provider-delivery approval, complete the approved synthetic Sandbox checkout. The receipt shows
+the commercial breakdown and retry-safe checkout reference without exposing provider or routing
+identifiers.
 
 The server will not start with `sk_live_…` or `pk_live_…` credentials. This repository is a
 test-mode integration reference, not a live payment proxy.

@@ -31,6 +31,8 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
 
 ## Optional failure clip
 
+- Never record this clip during the exactly-one production lifecycle proof. It requires separate
+  approval and a separate evidence window.
 - Submit without a complete buyer address to show the clear validation message, or use an
   approved decline test card.
 - Show only the safe customer message and request ID. Do not open provider logs in the video.
