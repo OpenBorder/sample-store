@@ -78,6 +78,27 @@ test(
         store.applyWebhook(webhook),
       ]);
       assert.deepEqual([...staged].sort(), ['duplicate', 'staged']);
+      for (let index = 2; index <= 8; index += 1) {
+        assert.equal(
+          await store.applyWebhook({
+            deliveryHash: `private-capacity-delivery-hash-${index}`,
+            paymentReferenceHash: `private-capacity-reference-hash-${index}`,
+            status: 'paid',
+            occurredAt: new Date(`2026-08-21T13:00:0${index}.000Z`),
+          }),
+          'staged',
+        );
+      }
+      assert.equal(await store.applyWebhook(webhook), 'duplicate');
+      assert.equal(
+        await store.applyWebhook({
+          deliveryHash: 'private-capacity-delivery-hash-9',
+          paymentReferenceHash: 'private-capacity-reference-hash-9',
+          status: 'paid',
+          occurredAt: new Date('2026-08-21T13:00:09.000Z'),
+        }),
+        'capacity_reached',
+      );
 
       await store.attachPaymentReference(accepted.checkoutId, paymentReferenceHash);
       assert.equal((await store.getByCheckoutId(accepted.checkoutId))?.status, 'paid');

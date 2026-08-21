@@ -430,6 +430,14 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
             DELETE FROM sample_store_pending_webhooks
             WHERE received_at < now() - ${PENDING_WEBHOOK_RETENTION_SECONDS} * interval '1 second'
           `;
+          const pendingDelivery = await transaction<{ present: boolean }[]>`
+            SELECT EXISTS (
+              SELECT 1
+              FROM sample_store_pending_webhooks
+              WHERE delivery_hash = ${input.deliveryHash}
+            ) AS present
+          `;
+          if (pendingDelivery[0]?.present) return 'duplicate' as const;
           const ownership = await transaction<{ active: boolean; pending: number }[]>`
             SELECT
               EXISTS (
