@@ -46,6 +46,81 @@ class FakeElement {
   }
 }
 
+interface FakeResponse {
+  json(): Promise<unknown>;
+}
+
+interface MountedPaymentOptions {
+  onSuccess(input: { paymentMethodId: string }): Promise<void>;
+}
+
+function createCheckoutRuntime(
+  source: string,
+  fetch: (url: string, init?: { body?: string }) => Promise<FakeResponse>,
+) {
+  const elements = new Map<string, FakeElement>();
+  const element = (id: string) => {
+    let current = elements.get(id);
+    if (!current) {
+      current = new FakeElement();
+      if (id === 'country') current.value = 'US';
+      if (['nav-ccy', 'pdp-ccy', 'drawer-ccy'].includes(id)) current.value = 'USD';
+      elements.set(id, current);
+    }
+    return current;
+  };
+  let checkoutCounter = 0;
+  let mountedPayment: MountedPaymentOptions | undefined;
+  const document = {
+    addEventListener() {},
+    createElement: () => new FakeElement(),
+    getElementById: element,
+    querySelectorAll: () => [] as FakeElement[],
+  };
+  const window = { addEventListener() {}, scrollTo() {} };
+  const context = createContext({
+    console,
+    crypto: { randomUUID: () => `checkout-${++checkoutCounter}` },
+    document,
+    fetch,
+    Intl,
+    location: { hash: '#/product/hoodie' },
+    OB_CONFIG: {
+      apiBaseUrl: 'https://mock.invalid',
+      publishableKey: 'browser-contract-key',
+      transactionsEnabled: true,
+    },
+    OpenBorder: () => ({
+      mount: (_selector: string, options: MountedPaymentOptions) => {
+        mountedPayment = options;
+        return { unmount() {} };
+      },
+    }),
+    window,
+  });
+  new Script(source).runInContext(context);
+  return {
+    element,
+    mountedPayment: () => {
+      assert.ok(mountedPayment);
+      return mountedPayment;
+    },
+  };
+}
+
+async function openCompletedBuyerForm(element: (id: string) => FakeElement) {
+  await element('pdp-add').dispatch('click');
+  for (const [id, value] of Object.entries({
+    email: 'buyer@example.invalid',
+    name: 'Browser Contract',
+    line1: '1 Test Street',
+    city: 'Test City',
+    postal_code: '94105',
+  })) {
+    element(id).value = value;
+  }
+}
+
 test('the public drawer requests a quote only after an explicit final-total action', async () => {
   const [script, page] = await Promise.all([
     readFile(join(process.cwd(), 'public/checkout.js'), 'utf8'),
@@ -72,63 +147,20 @@ test('the public drawer requests a quote only after an explicit final-total acti
 
 test('an in-flight quote locks all controls and rejects a stale response after a forced edit', async () => {
   const source = await readFile(join(process.cwd(), 'public/checkout.js'), 'utf8');
-  const elements = new Map<string, FakeElement>();
-  const element = (id: string) => {
-    let current = elements.get(id);
-    if (!current) {
-      current = new FakeElement();
-      if (id === 'country') current.value = 'US';
-      if (['nav-ccy', 'pdp-ccy', 'drawer-ccy'].includes(id)) current.value = 'USD';
-      elements.set(id, current);
-    }
-    return current;
-  };
-
-  let checkoutCounter = 0;
   let quoteCalls = 0;
   let resolveQuote!: (response: { json(): Promise<unknown> }) => void;
   const quoteResponse = new Promise<{ json(): Promise<unknown> }>((resolve) => {
     resolveQuote = resolve;
   });
-  const document = {
-    addEventListener() {},
-    createElement: () => new FakeElement(),
-    getElementById: element,
-    querySelectorAll: () => [] as FakeElement[],
-  };
-  const window = { addEventListener() {}, scrollTo() {} };
-  const context = createContext({
-    console,
-    crypto: { randomUUID: () => `checkout-${++checkoutCounter}` },
-    document,
-    fetch: async () => {
+  const runtime = createCheckoutRuntime(
+    source,
+    async () => {
       quoteCalls += 1;
       return quoteResponse;
     },
-    Intl,
-    location: { hash: '#/product/hoodie' },
-    OB_CONFIG: {
-      apiBaseUrl: 'https://mock.invalid',
-      publishableKey: 'browser-contract-key',
-      transactionsEnabled: true,
-    },
-    OpenBorder: () => ({
-      mount: () => ({ unmount() {} }),
-    }),
-    window,
-  });
-  new Script(source).runInContext(context);
-
-  await element('pdp-add').dispatch('click');
-  for (const [id, value] of Object.entries({
-    email: 'buyer@example.invalid',
-    name: 'Browser Contract',
-    line1: '1 Test Street',
-    city: 'Test City',
-    postal_code: '94105',
-  })) {
-    element(id).value = value;
-  }
+  );
+  const { element } = runtime;
+  await openCompletedBuyerForm(element);
 
   const review = element('review-total').dispatch('click');
   await Promise.resolve();
@@ -170,4 +202,54 @@ test('an in-flight quote locks all controls and rejects a stale response after a
   assert.equal(element('review-total').disabled, true);
   await element('review-total').dispatch('click', true);
   assert.equal(quoteCalls, 1, 'the invalidated drawer must never issue a second quote');
+});
+
+test('an outcome-unknown charge keeps the original payment method for an exact retry', async () => {
+  const source = await readFile(join(process.cwd(), 'public/checkout.js'), 'utf8');
+  const chargeBodies: Array<Record<string, unknown>> = [];
+  const runtime = createCheckoutRuntime(source, async (url, init) => {
+    if (url === '/quote') {
+      return {
+        json: async () => ({
+          ok: true,
+          domestic: false,
+          quoteToken: 'retry.browser-contract',
+          amount_breakdown: {
+            subtotal: 4200,
+            shipping: 0,
+            tax: 840,
+            duty: 210,
+            total: 5250,
+            currency: 'USD',
+          },
+        }),
+      };
+    }
+    assert.equal(url, '/charge');
+    chargeBodies.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
+    return {
+      json: async () => chargeBodies.length === 1
+        ? {
+            ok: false,
+            code: 'payment_status_unknown',
+            outcomeUnknown: true,
+          }
+        : { ok: true, status: 'payment_submitted' },
+    };
+  });
+
+  await openCompletedBuyerForm(runtime.element);
+  await runtime.element('review-total').dispatch('click');
+  const payment = runtime.mountedPayment();
+  await assert.rejects(
+    payment.onSuccess({ paymentMethodId: 'pm_original_browser_contract' }),
+    /payment_status_unknown/,
+  );
+  await payment.onSuccess({ paymentMethodId: 'pm_changed_browser_contract' });
+
+  assert.equal(chargeBodies.length, 2);
+  assert.equal(chargeBodies[0]?.paymentMethodId, 'pm_original_browser_contract');
+  assert.equal(chargeBodies[1]?.paymentMethodId, 'pm_original_browser_contract');
+  assert.equal(runtime.element('review-total').textContent, 'Order submitted');
+  assert.equal(runtime.element('review-total').disabled, true);
 });

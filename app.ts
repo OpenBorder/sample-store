@@ -562,10 +562,15 @@ export function createApp(
         sendPaymentOutcomeUnknown(res, error);
         return;
       }
-      await store.attachPaymentReference(
-        input.checkoutId,
-        hashPrivateReference(referenceSecret, paymentIntent.id),
-      );
+      try {
+        await store.attachPaymentReference(
+          input.checkoutId,
+          hashPrivateReference(referenceSecret, paymentIntent.id),
+        );
+      } catch (error) {
+        sendPaymentOutcomeUnknown(res, error);
+        return;
+      }
       res.json({
         ok: true,
         checkoutId: input.checkoutId,

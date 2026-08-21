@@ -488,6 +488,56 @@ test('provider errors return stable safe text and a request id', async () => {
   assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
 });
 
+test('post-provider attachment failure stays ambiguous and an exact retry drains staged success', async () => {
+  const gateway = new FakeGateway();
+  const durableStore = createMemoryOrderStore();
+  const referenceSecret = 'unit-test-signing-secret';
+  let failAttachment = true;
+  const store = {
+    ...durableStore,
+    attachPaymentReference: async (retryCheckoutId: string, paymentReferenceHash: string) => {
+      if (failAttachment) {
+        failAttachment = false;
+        throw new Error('simulated_attachment_failure');
+      }
+      return durableStore.attachPaymentReference(retryCheckoutId, paymentReferenceHash);
+    },
+  };
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    referenceSecret,
+    { store, referenceSecret },
+  );
+  const quoteToken = await getQuoteToken(app);
+  const chargeBody = { ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' };
+
+  const ambiguous = await request(app).post('/charge').send(chargeBody).expect(502);
+  assert.equal(ambiguous.body.code, 'payment_status_unknown');
+  assert.equal(ambiguous.body.outcomeUnknown, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+  assert.equal((await store.getUsage()).activeCheckout, true);
+
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'attachment-success-delivery',
+      paymentReferenceHash: createHmac('sha256', referenceSecret)
+        .update(paymentIntent.id)
+        .digest('hex'),
+      status: 'paid',
+      occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+    }),
+    'staged',
+  );
+
+  await request(app).post('/charge').send(chargeBody).expect(200);
+  assert.equal(gateway.paymentCalls.length, 2);
+  assert.equal(gateway.paymentCalls[0]?.key, gateway.paymentCalls[1]?.key);
+  assert.deepEqual(gateway.paymentCalls[0]?.input, gateway.paymentCalls[1]?.input);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal((await store.getUsage()).activeCheckout, false);
+});
+
 test('a definitive payment decline closes the order and releases the active slot', async () => {
   const gateway = new FakeGateway();
   const store = createMemoryOrderStore();
