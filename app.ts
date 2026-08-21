@@ -62,7 +62,7 @@ export interface OpenBorderGateway {
 interface AppConfig {
   publishableKey: string;
   apiBaseUrl?: string;
-  transactionCap: 0 | 1;
+  transactionCap: number;
 }
 
 interface AppOptions {
@@ -313,9 +313,10 @@ export function createApp(
   signingSecret: string,
   options: AppOptions = {},
 ) {
+  assertTransactionCap(config.transactionCap);
   if (signingSecret.length < 16) throw new Error('Quote signing secret must be at least 16 characters.');
   const transactionCap = config.transactionCap;
-  const transactionsEnabled = transactionCap === 1;
+  const transactionsEnabled = transactionCap > 0;
   const store = options.store ?? createMemoryOrderStore();
   const referenceSecret = options.referenceSecret ?? signingSecret;
   const durableOrders = options.store !== undefined;
@@ -349,16 +350,25 @@ export function createApp(
   const chargeLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false });
 
   app.get('/health', async (_req, res) => {
-    const [storeReady, trustedDemoProvenance] = await Promise.all([
+    const [storeReady, usage, trustedDemoProvenance] = await Promise.all([
       durableOrders ? store.checkReady().catch(() => false) : false,
+      durableOrders
+        ? store
+            .getUsage()
+            .catch(() => null)
+        : { activeCheckout: false, transactionsUsedToday: 0 },
       hasTrustedCustomApiProvenance(client, 'USD'),
     ]);
+    const durableStoreReady = storeReady && usage !== null;
     res.json({
       ok: true,
       mode: 'production-sandbox',
       transactionsEnabled,
-      durableOrders: storeReady,
-      authenticWebhooks: authenticWebhooks && storeReady,
+      transactionCap,
+      transactionsUsedToday: usage?.transactionsUsedToday ?? 0,
+      activeCheckout: usage?.activeCheckout ?? false,
+      durableOrders: durableStoreReady,
+      authenticWebhooks: authenticWebhooks && durableStoreReady,
       trustedDemoProvenance,
     });
   });
@@ -450,7 +460,16 @@ export function createApp(
         res.status(503).json({
           ok: false,
           code: 'transaction_cap_reached',
-          message: 'The approved demo transaction has already been used.',
+          message: 'The public demo transaction limit has been reached.',
+          requestId: res.locals.requestId,
+        });
+        return;
+      }
+      if (order === 'active_checkout') {
+        res.status(409).json({
+          ok: false,
+          code: 'checkout_in_progress',
+          message: 'Another demo checkout is still being reconciled. Try again later.',
           requestId: res.locals.requestId,
         });
         return;
@@ -577,9 +596,15 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
   );
 }
 
-function readTransactionCap(value: string | undefined): 0 | 1 {
+function readTransactionCap(value: string | undefined): number {
   const raw = value?.trim();
   if (!raw || raw === '0') return 0;
-  if (raw === '1') return 1;
-  throw new Error('DEMO_TRANSACTION_CAP must be 0 or 1.');
+  if (/^(?:[1-9]|[1-4][0-9]|50)$/.test(raw)) return Number(raw);
+  throw new Error('DEMO_TRANSACTION_CAP must be an integer from 0 through 50.');
+}
+
+function assertTransactionCap(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 50) {
+    throw new Error('Transaction cap must be an integer from 0 through 50.');
+  }
 }

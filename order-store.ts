@@ -15,15 +15,21 @@ export interface StoredOrder {
   readonly currency: string;
 }
 
-/** Serializes the lifetime cap check against concurrent order creation. */
+export interface OrderStoreUsage {
+  readonly activeCheckout: boolean;
+  readonly transactionsUsedToday: number;
+}
+
+/** Serializes the UTC-day cap and active-checkout checks across application instances. */
 const TRANSACTION_CAP_LOCK_KEY = 194_837_201;
 
 export interface OrderStore {
   checkReady(): Promise<boolean>;
+  getUsage(): Promise<OrderStoreUsage>;
   createOrGetWithinCap(
     order: StoredOrder,
-    transactionCap: 0 | 1,
-  ): Promise<StoredOrder | 'cap_reached'>;
+    transactionCap: number,
+  ): Promise<StoredOrder | 'active_checkout' | 'cap_reached'>;
   getByCheckoutId(checkoutId: string): Promise<StoredOrder | undefined>;
   attachPaymentReference(checkoutId: string, paymentReferenceHash: string): Promise<void>;
   applyWebhook(input: {
@@ -36,22 +42,52 @@ export interface OrderStore {
 }
 
 export function createMemoryOrderStore(
-  options: { readonly onWrite?: () => void } = {},
+  options: { readonly now?: () => Date; readonly onWrite?: () => void } = {},
 ): OrderStore & { deliveryCount(): number } {
   const orders = new Map<string, StoredOrder>();
+  const createdAt = new Map<string, Date>();
   const paymentReferences = new Map<string, string>();
   const deliveries = new Map<string, Date>();
+  const now = options.now ?? (() => new Date());
 
   return {
     checkReady: async () => true,
+    getUsage: async () => {
+      const startOfToday = startOfUtcDay(now());
+      const startOfTomorrow = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000);
+      return {
+        activeCheckout: [...orders.values()].some(
+          (stored) =>
+            stored.status === 'awaiting_payment' || stored.status === 'payment_submitted',
+        ),
+        transactionsUsedToday: [...createdAt.values()].filter(
+          (created) => created >= startOfToday && created < startOfTomorrow,
+        ).length,
+      };
+    },
     createOrGetWithinCap: async (order, transactionCap) => {
       const existing = orders.get(order.checkoutId);
       if (existing) {
         assertSameOrder(existing, order);
         return existing;
       }
-      if (orders.size >= transactionCap) return 'cap_reached';
+      if (
+        [...orders.values()].some(
+          (stored) =>
+            stored.status === 'awaiting_payment' || stored.status === 'payment_submitted',
+        )
+      ) {
+        return 'active_checkout';
+      }
+      const admissionTime = now();
+      const startOfToday = startOfUtcDay(admissionTime);
+      const startOfTomorrow = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000);
+      const usedToday = [...createdAt.values()].filter(
+        (created) => created >= startOfToday && created < startOfTomorrow,
+      ).length;
+      if (usedToday >= transactionCap) return 'cap_reached';
       orders.set(order.checkoutId, { ...order });
+      createdAt.set(order.checkoutId, admissionTime);
       options.onWrite?.();
       return order;
     },
@@ -87,12 +123,50 @@ export function createMemoryOrderStore(
 export function createPostgresOrderStore(sql: Sql): OrderStore {
   return {
     checkReady: async () => {
-      const rows = await sql<{ orders: string | null; deliveries: string | null }[]>`
+      const rows = await sql<{
+        activeCheckout: string | null;
+        dailyCap: string | null;
+        deliveries: string | null;
+        deliveryRetention: string | null;
+        orders: string | null;
+      }[]>`
         SELECT
           to_regclass('sample_store_orders')::text AS orders,
-          to_regclass('sample_store_webhook_deliveries')::text AS deliveries
+          to_regclass('sample_store_webhook_deliveries')::text AS deliveries,
+          to_regclass('sample_store_webhook_deliveries_retention_idx')::text
+            AS "deliveryRetention",
+          to_regclass('sample_store_orders_utc_day_idx')::text AS "dailyCap",
+          to_regclass('sample_store_orders_single_active_idx')::text
+            AS "activeCheckout"
       `;
-      return Boolean(rows[0]?.orders && rows[0]?.deliveries);
+      return Boolean(
+        rows[0]?.orders &&
+          rows[0]?.deliveries &&
+          rows[0]?.deliveryRetention &&
+          rows[0]?.dailyCap &&
+          rows[0]?.activeCheckout,
+      );
+    },
+    getUsage: async () => {
+      const rows = await sql<OrderStoreUsage[]>`
+        SELECT
+          EXISTS (
+            SELECT 1
+            FROM sample_store_orders
+            WHERE status IN ('awaiting_payment', 'payment_submitted')
+          ) AS "activeCheckout",
+          count(*) FILTER (
+            WHERE created_at >= (
+              date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            )
+              AND created_at < (
+                (date_trunc('day', now() AT TIME ZONE 'UTC') + interval '1 day')
+                AT TIME ZONE 'UTC'
+              )
+          )::int AS "transactionsUsedToday"
+        FROM sample_store_orders
+      `;
+      return rows[0] ?? { activeCheckout: false, transactionsUsedToday: 0 };
     },
     createOrGetWithinCap: async (order, transactionCap) =>
       sql.begin(async (transaction) => {
@@ -113,8 +187,24 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
           assertSameOrder(existing, order);
           return existing;
         }
+        const activeRows = await transaction<{ active: boolean }[]>`
+          SELECT EXISTS (
+            SELECT 1
+            FROM sample_store_orders
+            WHERE status IN ('awaiting_payment', 'payment_submitted')
+          ) AS active
+        `;
+        if (activeRows[0]?.active) return 'active_checkout' as const;
         const [counted] = await transaction<{ count: number }[]>`
-          SELECT count(*)::int AS count FROM sample_store_orders
+          SELECT count(*)::int AS count
+          FROM sample_store_orders
+          WHERE created_at >= (
+            date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+          )
+            AND created_at < (
+              (date_trunc('day', now() AT TIME ZONE 'UTC') + interval '1 day')
+              AT TIME ZONE 'UTC'
+            )
         `;
         if ((counted?.count ?? 0) >= transactionCap) return 'cap_reached' as const;
         await transaction`
@@ -183,6 +273,12 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
       return rows.count;
     },
   };
+}
+
+function startOfUtcDay(value: Date): Date {
+  return new Date(
+    Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()),
+  );
 }
 
 async function getOrder(sql: Sql, checkoutId: string): Promise<StoredOrder | undefined> {

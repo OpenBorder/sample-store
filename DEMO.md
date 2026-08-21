@@ -5,8 +5,8 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
 ## Before recording
 
 - Open the deployed sample store in a clean browser profile.
-- Confirm `/health` reports production-Sandbox mode and whether transactions are explicitly
-  enabled. Stop if durable orders or authentic webhooks are false.
+- Confirm `/health` reports production-Sandbox mode, the approved cap, UTC-day usage, and no active
+  checkout. Stop if durable orders, authentic webhooks, or trusted Custom API provenance are false.
 - Use a dedicated demo buyer and non-sensitive shipping address.
 - Open the production dashboard's **Sandbox Transactions** view in a second tab.
 - Hide bookmarks, notifications, environment settings, and all secret-key screens.
@@ -26,7 +26,8 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
    `@open-border/js`; the backend keeps the secret key and uses `@open-border/node` for the tax
    quote and payment intent.
 7. **Close with safety.** Mention that the displayed quote is signed, retries reuse one checkout
-   key, public inputs are catalog-validated, and live keys are refused.
+   key, only one unresolved checkout can exist, the global count is capped per UTC day, public
+   inputs are catalog-validated, and live keys are refused.
 
 ## Optional failure clip
 
