@@ -227,6 +227,10 @@ const providerMessage = (code: string) => {
   return 'Open Border could not complete this test request. Please try again.';
 };
 
+const isDefinitivePaymentFailure = (error: unknown) =>
+  error instanceof OpenBorderApiError &&
+  ['payment_declined', 'validation_error', 'idempotency_key_conflict'].includes(error.code);
+
 async function hasTrustedCustomApiProvenance(
   client: OpenBorderGateway,
   currency: Currency,
@@ -392,6 +396,10 @@ export function createApp(
       return;
     }
     try {
+      if (!(await store.checkReady().catch(() => false))) {
+        res.status(503).json({ ok: false, code: 'demo_not_ready' });
+        return;
+      }
       const input = parseCheckoutInput(req.body, false);
       const product = CATALOG[input.productId];
       if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
@@ -442,6 +450,10 @@ export function createApp(
       return;
     }
     try {
+      if (!(await store.checkReady().catch(() => false))) {
+        res.status(503).json({ ok: false, code: 'demo_not_ready' });
+        return;
+      }
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
       if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
@@ -474,6 +486,19 @@ export function createApp(
         });
         return;
       }
+      if (order.status === 'paid') {
+        res.json({ ok: true, checkoutId: input.checkoutId, status: 'reconciled' });
+        return;
+      }
+      if (order.status === 'payment_failed') {
+        res.status(409).json({
+          ok: false,
+          code: 'checkout_closed',
+          message: 'This test checkout is already closed. Start a new checkout.',
+          requestId: res.locals.requestId,
+        });
+        return;
+      }
       const paymentInput: CreatePaymentIntentInput = {
         tax_quote_id: quote.taxQuoteId,
         amount: input.amount,
@@ -487,9 +512,17 @@ export function createApp(
         metadata: { demo: 'custom-api-reference', checkout_id: input.checkoutId },
       };
 
-      const paymentIntent = await client.createPaymentIntent(paymentInput, {
-        idempotencyKey: order.idempotencyKey,
-      });
+      let paymentIntent: PaymentIntentResponse;
+      try {
+        paymentIntent = await client.createPaymentIntent(paymentInput, {
+          idempotencyKey: order.idempotencyKey,
+        });
+      } catch (error) {
+        if (isDefinitivePaymentFailure(error)) {
+          await store.markPaymentFailed(input.checkoutId);
+        }
+        throw error;
+      }
       await store.attachPaymentReference(
         input.checkoutId,
         hashPrivateReference(referenceSecret, paymentIntent.id),

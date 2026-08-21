@@ -11,6 +11,21 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: pay645_test
+          POSTGRES_PASSWORD: pay645_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pay645_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PAY645_POSTGRES_TEST_URL: postgres://postgres:pay645_ci_test@127.0.0.1:5432/pay645_test
     steps:
       - uses: actions/checkout@v4
         with:

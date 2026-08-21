@@ -41,7 +41,10 @@ Browser (public pk_)                         Backend (secret sk_)
 - **Authentic Test-only terminal reconciliation.** Raw signed webhooks are timestamp-checked,
   replay-safe, durably deduplicated, and projected onto the persisted order only when the signed
   event declares Test mode. External delivery and payment references are stored only as keyed
-  hashes.
+  hashes. An owned terminal event that wins the response/attachment race is staged during the
+  single active-checkout window, then consumed atomically when the payment reference attaches.
+  Pending evidence is short-lived and bounded, and terminal orders never regress on retries or
+  contradictory later deliveries.
 - **Displayed-total integrity.** The server signs the exact quote shown in the payment element.
   The charge must use that same unexpired quote; changed or tampered checkout data is rejected.
 - **Safe public-demo behavior.** The hosted runtime starts at a cap of zero and accepts only exact
@@ -92,9 +95,11 @@ npm run check:secrets
 The tests cover catalog tampering, signed displayed quotes, same-key retries, atomic UTC-day cap
 admission through the 50th/51st boundary, single-active-checkout enforcement, UTC reset, cap-zero
 readiness, secret-safe cap usage health, current trade-lane quoting, trusted Custom API provenance,
-signed Test-only reconciliation, changed-request rejection, provider-safe errors, malformed JSON,
-the local throttle, and Live-key refusal. CI also runs the repository secret scanner on every
-tracked and untracked source file.
+bounded early-webhook staging, monotonic terminal reconciliation, changed-request rejection,
+provider-safe errors, malformed JSON, the local throttle, and Live-key refusal. CI provisions a
+dedicated disposable PostgreSQL database for real multi-connection admission, attachment/webhook
+interleaving, restart durability, deduplication, and UTC-cap tests. It also runs the repository
+secret scanner on every tracked and untracked source file.
 
 For a sustained public deployment, add a platform-level rate-limit rule for `/quote` and
 `/charge`. An in-process limiter resets with serverless instances and is only a local safety net.
@@ -115,8 +120,9 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 `/charge` to.
 
 1. Import the repo in Vercel (framework preset **Other**, no build command).
-2. Apply `migrations/001_durable_orders.sql`, then `migrations/002_daily_transaction_cap.sql`, to
-   an owned durable Postgres database.
+2. Apply `migrations/001_durable_orders.sql`, `migrations/002_daily_transaction_cap.sql`, then
+   `migrations/003_webhook_reconciliation.sql`, in that order to an owned durable Postgres
+   database.
 3. Configure the Test credential pair, exact Sandbox API host, webhook signing secret, database
    connection, and private-reference HMAC secret in the hosting platform.
 4. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning, database readiness, deployment,

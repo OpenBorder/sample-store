@@ -13,6 +13,7 @@ import {
   type OpenBorderGateway,
 } from '../app';
 import { createMemoryOrderStore } from '../order-store';
+import { hashPrivateReference } from '../webhook';
 
 const checkoutId = '018f4f31-86d4-7b2e-b6bd-7f53f5f98c71';
 const input = {
@@ -194,7 +195,11 @@ test('an authentic terminal webhook updates the durable order exactly once', asy
   const body = JSON.stringify({
     type: 'payment_intent.succeeded',
     mode: 'test',
-    data: { paymentIntentId: 'provider_reference_must_stay_private' },
+    occurredAt: new Date(Number(timestamp) * 1000).toISOString(),
+    data: {
+      paymentIntentId: 'provider_reference_must_stay_private',
+      demoStore: 'custom_api',
+    },
   });
   const signature = createHmac('sha256', webhookSecret)
     .update(`${timestamp}.${delivery}.${body}`)
@@ -213,6 +218,154 @@ test('an authentic terminal webhook updates the durable order exactly once', asy
 
   assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
   assert.equal(store.deliveryCount(), 1);
+
+  const terminalRetry = await request(app)
+    .post('/charge')
+    .send({ ...input, quoteToken, paymentMethodId: 'pm_test_token' })
+    .expect(200);
+  assert.equal(terminalRetry.body.status, 'reconciled');
+  assert.equal(gateway.paymentCalls, 1);
+});
+
+test('an owned terminal webhook received before reference attachment is staged and reconciled', async () => {
+  const store = createMemoryOrderStore();
+  const paymentReferenceHash = 'private_payment_hash';
+  await store.createOrGetWithinCap(
+    {
+      checkoutId,
+      idempotencyKey: 'stable-key',
+      status: 'awaiting_payment',
+      productId: 'hoodie',
+      amount: 3400,
+      currency: 'GBP',
+    },
+    50,
+  );
+
+  const first = await store.applyWebhook({
+    deliveryHash: 'private_delivery_hash',
+    paymentReferenceHash,
+    status: 'paid',
+    occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+  });
+  const duplicateBeforeAttachment = await store.applyWebhook({
+    deliveryHash: 'private_delivery_hash',
+    paymentReferenceHash,
+    status: 'paid',
+    occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+  });
+
+  assert.equal(first, 'staged');
+  assert.equal(duplicateBeforeAttachment, 'duplicate');
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'awaiting_payment');
+
+  await store.attachPaymentReference(checkoutId, paymentReferenceHash);
+
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal(store.deliveryCount(), 1);
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'private_delivery_hash',
+      paymentReferenceHash,
+      status: 'paid',
+      occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+    }),
+    'duplicate',
+  );
+});
+
+test('unknown signed events are staged only inside one bounded active-checkout window', async () => {
+  let now = new Date('2026-08-21T13:00:00.000Z');
+  const store = createMemoryOrderStore({ now: () => now });
+  const beforeCheckout = await store.applyWebhook({
+    deliveryHash: 'delivery_before_checkout',
+    paymentReferenceHash: 'reference_before_checkout',
+    status: 'paid',
+    occurredAt: now,
+  });
+  assert.equal(beforeCheckout, 'unowned');
+
+  await store.createOrGetWithinCap(
+    {
+      checkoutId,
+      idempotencyKey: 'stable-key',
+      status: 'awaiting_payment',
+      productId: 'hoodie',
+      amount: 3400,
+      currency: 'GBP',
+    },
+    50,
+  );
+  for (let index = 1; index <= 8; index += 1) {
+    assert.equal(
+      await store.applyWebhook({
+        deliveryHash: `bounded_delivery_${index}`,
+        paymentReferenceHash: `bounded_reference_${index}`,
+        status: 'paid',
+        occurredAt: now,
+      }),
+      'staged',
+    );
+  }
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'bounded_delivery_9',
+      paymentReferenceHash: 'bounded_reference_9',
+      status: 'paid',
+      occurredAt: now,
+    }),
+    'capacity_reached',
+  );
+
+  now = new Date(now.getTime() + 16 * 60 * 1000);
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'bounded_delivery_after_expiry',
+      paymentReferenceHash: 'bounded_reference_after_expiry',
+      status: 'paid',
+      occurredAt: now,
+    }),
+    'staged',
+  );
+});
+
+test('terminal orders cannot regress on retry or a contradictory delivery', async () => {
+  const store = createMemoryOrderStore();
+  const paymentReferenceHash = 'private_payment_hash';
+  await store.createOrGetWithinCap(
+    {
+      checkoutId,
+      idempotencyKey: 'stable-key',
+      status: 'awaiting_payment',
+      productId: 'hoodie',
+      amount: 3400,
+      currency: 'GBP',
+    },
+    50,
+  );
+  await store.attachPaymentReference(checkoutId, paymentReferenceHash);
+  await store.applyWebhook({
+    deliveryHash: 'delivery_success',
+    paymentReferenceHash,
+    status: 'paid',
+    occurredAt: new Date('2026-08-21T13:00:00.000Z'),
+  });
+
+  assert.equal(
+    await store.attachPaymentReference(checkoutId, paymentReferenceHash),
+    'terminal_noop',
+  );
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'delivery_late_failure',
+      paymentReferenceHash,
+      status: 'payment_failed',
+      occurredAt: new Date('2026-08-21T13:01:00.000Z'),
+    }),
+    'terminal_noop',
+  );
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal(store.deliveryCount(), 2);
 });
 
 test('signed non-Test terminal events are acknowledged without reconciliation evidence', async () => {
@@ -239,7 +392,11 @@ test('signed non-Test terminal events are acknowledged without reconciliation ev
     const body = JSON.stringify({
       type: 'payment_intent.succeeded',
       ...(mode === undefined ? {} : { mode }),
-      data: { paymentIntentId: 'provider_reference_must_stay_private' },
+      occurredAt: new Date(Number(timestamp) * 1000).toISOString(),
+      data: {
+        paymentIntentId: 'provider_reference_must_stay_private',
+        demoStore: 'custom_api',
+      },
     });
     const signature = createHmac('sha256', webhookSecret)
       .update(`${timestamp}.${delivery}.${body}`)
@@ -256,6 +413,108 @@ test('signed non-Test terminal events are acknowledged without reconciliation ev
 
   assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_submitted');
   assert.equal(store.deliveryCount(), 0);
+});
+
+test('signed Test events with missing or foreign demo provenance are not staged', async () => {
+  const store = createMemoryOrderStore();
+  const webhookSecret = 'whsec_test_receiver';
+  const referenceSecret = 'private-reference-secret-for-tests';
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    new Gateway(),
+    'quote-signing-secret-for-tests',
+    { store, referenceSecret, webhookSecret },
+  );
+  await store.createOrGetWithinCap(
+    {
+      checkoutId,
+      idempotencyKey: 'stable-key',
+      status: 'awaiting_payment',
+      productId: 'hoodie',
+      amount: 3400,
+      currency: 'GBP',
+    },
+    50,
+  );
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const paymentIntentId = 'provider_reference_must_stay_private';
+  for (const [index, demoStore] of [undefined, 'medusa', 'custom-api'].entries()) {
+    const delivery = `delivery_foreign_provenance_${index}`;
+    const body = JSON.stringify({
+      type: 'payment_intent.succeeded',
+      mode: 'test',
+      occurredAt: new Date(Number(timestamp) * 1000).toISOString(),
+      data: {
+        paymentIntentId,
+        ...(demoStore ? { demoStore } : {}),
+      },
+    });
+    const signature = createHmac('sha256', webhookSecret)
+      .update(`${timestamp}.${delivery}.${body}`)
+      .digest('hex');
+    await request(app)
+      .post('/webhooks/openborder')
+      .set('Content-Type', 'application/json')
+      .set('OpenBorder-Webhook-Id', delivery)
+      .set('OpenBorder-Webhook-Timestamp', timestamp)
+      .set('OpenBorder-Webhook-Signature', `v1=${signature},t=${timestamp}`)
+      .send(body)
+      .expect(204);
+  }
+
+  await store.attachPaymentReference(
+    checkoutId,
+    hashPrivateReference(referenceSecret, paymentIntentId),
+  );
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_submitted');
+  assert.equal(store.deliveryCount(), 0);
+});
+
+test('an owned signed webhook returns retryable failure when durable staging fails', async () => {
+  const baseStore = createMemoryOrderStore();
+  const store = {
+    ...baseStore,
+    applyWebhook: async () => {
+      throw new Error('database unavailable');
+    },
+  };
+  const gateway = new Gateway();
+  const webhookSecret = 'whsec_test_receiver';
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'quote-signing-secret-for-tests',
+    {
+      store,
+      referenceSecret: 'private-reference-secret-for-tests',
+      webhookSecret,
+    },
+  );
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const delivery = 'delivery_retryable';
+  const body = JSON.stringify({
+    type: 'payment_intent.succeeded',
+    mode: 'test',
+    occurredAt: new Date(Number(timestamp) * 1000).toISOString(),
+    data: {
+      paymentIntentId: 'provider_reference_must_stay_private',
+      demoStore: 'custom_api',
+    },
+  });
+  const signature = createHmac('sha256', webhookSecret)
+    .update(`${timestamp}.${delivery}.${body}`)
+    .digest('hex');
+
+  const response = await request(app)
+    .post('/webhooks/openborder')
+    .set('Content-Type', 'application/json')
+    .set('OpenBorder-Webhook-Id', delivery)
+    .set('OpenBorder-Webhook-Timestamp', timestamp)
+    .set('OpenBorder-Webhook-Signature', `v1=${signature},t=${timestamp}`)
+    .send(body)
+    .expect(503);
+
+  assert.deepEqual(response.body, { ok: false, code: 'webhook_retry' });
 });
 
 test('production starts at zero cap without credentials and enabling requires every prerequisite', async () => {
