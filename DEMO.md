@@ -5,9 +5,9 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
 ## Before recording
 
 - Open the local tutorial store at `http://127.0.0.1:4000` in a clean browser profile.
-- Confirm `/health` reports `local-tutorial`, cap `1`, zero usage, no active checkout, and trusted
-  Custom API provenance. It truthfully reports non-durable orders and no authentic webhooks; do not
-  describe the local tutorial as production-ready or reconciled.
+- Confirm `/health` reports `local-tutorial`, cap `1`, zero usage, no active checkout, and
+  `trustedDemoProvenanceRequired: false`. It truthfully reports non-durable orders and no authentic
+  webhooks; do not describe the local tutorial as production-ready or reconciled.
 - Use a dedicated demo buyer and non-sensitive shipping address.
 - Open the production dashboard's **Sandbox Transactions** view in a second tab.
 - Hide bookmarks, notifications, environment settings, and all secret-key screens.
