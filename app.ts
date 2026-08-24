@@ -64,6 +64,7 @@ interface AppConfig {
   apiBaseUrl?: string;
   transactionCap: number;
   mode?: 'local-tutorial' | 'production-sandbox';
+  requireTrustedDemoProvenance?: boolean;
 }
 
 interface AppOptions {
@@ -384,6 +385,7 @@ export function createApp(
   if (signingSecret.length < 16) throw new Error('Quote signing secret must be at least 16 characters.');
   const transactionCap = config.transactionCap;
   const transactionsEnabled = transactionCap > 0;
+  const trustedDemoProvenanceRequired = config.requireTrustedDemoProvenance ?? true;
   const store = options.store ?? createMemoryOrderStore();
   const referenceSecret = options.referenceSecret ?? signingSecret;
   const durableOrders = options.store !== undefined;
@@ -437,6 +439,7 @@ export function createApp(
       durableOrders: durableStoreReady,
       authenticWebhooks: authenticWebhooks && durableStoreReady,
       trustedDemoProvenance,
+      ...(trustedDemoProvenanceRequired ? {} : { trustedDemoProvenanceRequired: false }),
     });
   });
 
@@ -465,7 +468,10 @@ export function createApp(
       }
       const input = parseCheckoutInput(req.body, false);
       const product = CATALOG[input.productId];
-      if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
+      if (
+        trustedDemoProvenanceRequired &&
+        !(await hasTrustedCustomApiProvenance(client, input.currency))
+      ) {
         sendDemoProvenanceUnavailable(res);
         return;
       }
@@ -519,7 +525,10 @@ export function createApp(
       }
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
-      if (!(await hasTrustedCustomApiProvenance(client, input.currency))) {
+      if (
+        trustedDemoProvenanceRequired &&
+        !(await hasTrustedCustomApiProvenance(client, input.currency))
+      ) {
         sendDemoProvenanceUnavailable(res);
         return;
       }
@@ -664,6 +673,7 @@ export function createConfiguredApp(
         apiBaseUrl,
         transactionCap: 1,
         mode: 'local-tutorial',
+        requireTrustedDemoProvenance: false,
       },
       client,
       signingSecret,

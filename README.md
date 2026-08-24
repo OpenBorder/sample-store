@@ -75,9 +75,12 @@ does not require PostgreSQL, a webhook signing secret, or an order-reference HMA
 
 The simplified path is not durable and cannot reconcile an asynchronous payment outcome: its
 `/health` response reports `mode: "local-tutorial"`, `durableOrders: false`, and
-`authenticWebhooks: false`. After submitting the one Test payment, restart the local server before
-rehearsing again. Restarting clears only the local in-memory guard; it does not delete or reconcile
-the Test payment created in Open Border. Never deploy `server.ts` as the hosted store.
+`authenticWebhooks: false`. It also reports `trustedDemoProvenanceRequired: false`, because an
+ordinary viewer-owned Test key pair is not expected to carry the hosted public store's internal
+`demo_store=custom_api` attestation. After submitting the one Test payment, restart the local server
+before rehearsing again. Restarting clears only the local in-memory guard; it does not delete or
+reconcile the Test payment created in Open Border. Never deploy `server.ts` as the hosted store;
+the hosted path still requires trusted Custom API provenance before quote or payment I/O.
 
 Open the store, pick a **currency** in the top bar (the price and settlement region change
 with it), open a product, and click **Add to bag**. In the checkout drawer, fill in the buyer

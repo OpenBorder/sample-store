@@ -752,6 +752,7 @@ test('malformed JSON returns the normal safe validation envelope', async () => {
 
 test('local tutorial needs only Test keys and permits one non-durable checkout per restart', async () => {
   const gateway = new FakeGateway();
+  gateway.demoStore = undefined;
   const app = createConfiguredApp(
     {
       OB_SECRET_KEY: 'sk_test_local_tutorial',
@@ -770,7 +771,8 @@ test('local tutorial needs only Test keys and permits one non-durable checkout p
     activeCheckout: false,
     durableOrders: false,
     authenticWebhooks: false,
-    trustedDemoProvenance: true,
+    trustedDemoProvenance: false,
+    trustedDemoProvenanceRequired: false,
   });
 
   const config = await request(app).get('/config.js').expect(200);
@@ -795,6 +797,7 @@ test('local tutorial needs only Test keys and permits one non-durable checkout p
     .expect(409);
 
   assert.equal(blocked.body.code, 'checkout_in_progress');
+  assert.equal(gateway.configCalls, 1);
   assert.equal(gateway.paymentCalls.length, 1);
 });
 
