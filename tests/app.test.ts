@@ -750,6 +750,68 @@ test('malformed JSON returns the normal safe validation envelope', async () => {
   assert.equal(response.body.fields.body, 'Send valid JSON.');
 });
 
+test('local tutorial needs only Test keys and permits one non-durable checkout per restart', async () => {
+  const gateway = new FakeGateway();
+  const app = createConfiguredApp(
+    {
+      OB_SECRET_KEY: 'sk_test_local_tutorial',
+      OB_PUBLISHABLE_KEY: 'pk_test_local_tutorial',
+    },
+    { runtime: 'local-tutorial', gateway },
+  );
+
+  const health = await request(app).get('/health').expect(200);
+  assert.deepEqual(health.body, {
+    ok: true,
+    mode: 'local-tutorial',
+    transactionsEnabled: true,
+    transactionCap: 1,
+    transactionsUsedToday: 0,
+    activeCheckout: false,
+    durableOrders: false,
+    authenticWebhooks: false,
+    trustedDemoProvenance: true,
+  });
+
+  const config = await request(app).get('/config.js').expect(200);
+  assert.match(config.text, /"transactionsEnabled":true/);
+  assert.match(config.text, /pk_test_local_tutorial/);
+  assert.doesNotMatch(config.text, /sk_test_local_tutorial/);
+
+  const quoteToken = await getQuoteToken(app);
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  const secondInput = {
+    ...baseInput,
+    checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72',
+  };
+  const secondQuoteToken = await getQuoteToken(app, secondInput);
+  const blocked = await request(app)
+    .post('/charge')
+    .send({ ...secondInput, quoteToken: secondQuoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(409);
+
+  assert.equal(blocked.body.code, 'checkout_in_progress');
+  assert.equal(gateway.paymentCalls.length, 1);
+});
+
+test('local tutorial refuses untouched credential placeholders at startup', () => {
+  assert.throws(
+    () =>
+      createConfiguredApp(
+        {
+          OB_SECRET_KEY: 'sk_test_...',
+          OB_PUBLISHABLE_KEY: 'pk_test_...',
+        },
+        { runtime: 'local-tutorial' },
+      ),
+    /replace the placeholder Test credentials/i,
+  );
+});
+
 test('charge attempts are rate limited for public-demo safety', async () => {
   const { app } = createTestApp();
   for (let attempt = 0; attempt < 10; attempt += 1) {
