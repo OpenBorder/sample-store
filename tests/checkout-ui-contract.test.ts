@@ -122,12 +122,20 @@ async function openCompletedBuyerForm(element: (id: string) => FakeElement) {
 }
 
 test('the public drawer requests a quote only after an explicit final-total action', async () => {
-  const [script, page] = await Promise.all([
+  const [script, page, manifestSource] = await Promise.all([
     readFile(join(process.cwd(), 'public/checkout.js'), 'utf8'),
     readFile(join(process.cwd(), 'public/index.html'), 'utf8'),
+    readFile(join(process.cwd(), 'package.json'), 'utf8'),
   ]);
+  const manifest = JSON.parse(manifestSource) as { dependencies: Record<string, string> };
 
   assert.match(page, /id="review-total"[^>]*type="button"/);
+  assert.match(
+    page,
+    new RegExp(
+      `unpkg\\.com/@open-border/js@${manifest.dependencies['@open-border/node'].replaceAll('.', '\\.')}"`,
+    ),
+  );
   for (const id of ['email', 'name', 'line1', 'city', 'postal_code', 'country']) {
     assert.match(page, new RegExp(`id="${id}"[^>]*required`));
   }

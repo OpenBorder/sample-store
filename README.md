@@ -61,7 +61,8 @@ fulfilment, inventory, and live payments.
 ## Run the local tutorial
 
 Requires Node 20+ and an Open Border **Test** key pair. Those are the only two values a tutorial
-viewer needs to configure.
+viewer needs to configure. Dependencies come from public npm packages, so the clone needs no
+`.npmrc`, registry token, database, or private Open Border repository.
 
 ```
 cp .env.example .env    # fill in only OB_SECRET_KEY + OB_PUBLISHABLE_KEY
