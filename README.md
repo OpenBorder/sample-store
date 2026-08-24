@@ -58,28 +58,40 @@ Browser (public pk_)                         Backend (secret sk_)
 This is a reference demo, not a production commerce application. It deliberately omits accounts,
 fulfilment, inventory, and live payments.
 
-## Run locally
+## Run the local tutorial
 
-Requires Node 20+ and an Open Border **test** key pair.
+Requires Node 20+ and an Open Border **Test** key pair. Those are the only two values a tutorial
+viewer needs to configure.
 
 ```
-cp .env.example .env    # fill in OB_SECRET_KEY + OB_PUBLISHABLE_KEY
+cp .env.example .env    # fill in only OB_SECRET_KEY + OB_PUBLISHABLE_KEY
 npm install
-npm start               # http://localhost:4000
+npm start               # http://127.0.0.1:4000
 ```
+
+`npm start` is a deliberately local-only tutorial path. It binds to `127.0.0.1`, accepts Test keys
+only, uses the exact Sandbox API, and permits one in-memory Test checkout per server restart. It
+does not require PostgreSQL, a webhook signing secret, or an order-reference HMAC secret.
+
+The simplified path is not durable and cannot reconcile an asynchronous payment outcome: its
+`/health` response reports `mode: "local-tutorial"`, `durableOrders: false`, and
+`authenticWebhooks: false`. After submitting the one Test payment, restart the local server before
+rehearsing again. Restarting clears only the local in-memory guard; it does not delete or reconcile
+the Test payment created in Open Border. Never deploy `server.ts` as the hosted store.
 
 Open the store, pick a **currency** in the top bar (the price and settlement region change
 with it), open a product, and click **Add to bag**. In the checkout drawer, fill in the buyer
 details, then click **Review order total** exactly once to quote duties and taxes. Buyer or currency
 changes before that action only reset local state; after a successful quote, the final fields and
 total remain locked for that checkout. The ships-from origin is the US, so a US address is domestic
-and shows no duties/taxes; pick e.g. United Kingdom or Canada to see them. Only after the separate
-provider-delivery approval, complete the approved synthetic Sandbox checkout. The receipt shows
-the commercial breakdown and retry-safe checkout reference without exposing provider or routing
-identifiers.
+and shows no duties/taxes; pick e.g. United Kingdom or Canada to see them. Complete at most one
+synthetic Test checkout; no real money moves. The receipt shows the commercial breakdown and
+retry-safe checkout reference without exposing provider or routing identifiers. It proves only
+submission from the local tutorial, not durable order reconciliation.
 
-The server will not start with `sk_live_…` or `pk_live_…` credentials. This repository is a
-test-mode integration reference, not a live payment proxy.
+The local server will not start with `sk_live_…` or `pk_live_…` credentials. Keep both Test keys
+out of the recording, terminal history, source files, and browser-visible configuration. This
+repository is a Test-mode integration reference, not a live payment proxy.
 
 ## Verify a fresh clone
 

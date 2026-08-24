@@ -63,12 +63,18 @@ interface AppConfig {
   publishableKey: string;
   apiBaseUrl?: string;
   transactionCap: number;
+  mode?: 'local-tutorial' | 'production-sandbox';
 }
 
 interface AppOptions {
   store?: OrderStore;
   webhookSecret?: string;
   referenceSecret?: string;
+}
+
+interface ConfiguredAppOptions {
+  runtime?: 'hosted' | 'local-tutorial';
+  gateway?: OpenBorderGateway;
 }
 
 type ProvenanceCheckoutConfigResponse = CheckoutConfigResponse & {
@@ -423,7 +429,7 @@ export function createApp(
     const durableStoreReady = storeReady && usage !== null;
     res.json({
       ok: true,
-      mode: 'production-sandbox',
+      mode: config.mode ?? 'production-sandbox',
       transactionsEnabled,
       transactionCap,
       transactionsUsedToday: usage?.transactionsUsedToday ?? 0,
@@ -637,11 +643,34 @@ export function createApp(
   return app;
 }
 
-export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
-  const transactionCap = readTransactionCap(env.DEMO_TRANSACTION_CAP);
+export function createConfiguredApp(
+  env: NodeJS.ProcessEnv = process.env,
+  options: ConfiguredAppOptions = {},
+) {
   const secretKey = env.OB_SECRET_KEY;
   const publishableKey = env.OB_PUBLISHABLE_KEY;
   const apiBaseUrl = env.OB_API_URL ?? 'https://api-sandbox.openborderpayments.com';
+
+  if (options.runtime === 'local-tutorial') {
+    assertTestCredentials(secretKey, publishableKey);
+    assertSandboxApiUrl(apiBaseUrl);
+    const client = options.gateway ?? createOpenBorderClient(secretKey!, apiBaseUrl);
+    const signingSecret = createHash('sha256')
+      .update(`local-tutorial\0${secretKey}`)
+      .digest('hex');
+    return createApp(
+      {
+        publishableKey: publishableKey!,
+        apiBaseUrl,
+        transactionCap: 1,
+        mode: 'local-tutorial',
+      },
+      client,
+      signingSecret,
+    );
+  }
+
+  const transactionCap = readTransactionCap(env.DEMO_TRANSACTION_CAP);
   const databaseUrl = env.DATABASE_URL;
   const webhookSecret = env.OB_WEBHOOK_SECRET;
   const referenceSecret = env.ORDER_REFERENCE_HMAC_SECRET;
@@ -668,23 +697,8 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
     );
   }
 
-  if (!secretKey || !publishableKey) {
-    throw new Error('Configured demo readiness requires Test credentials.');
-  }
-  if (!secretKey.startsWith('sk_test_') || !publishableKey.startsWith('pk_test_')) {
-    throw new Error('This public demo accepts Open Border test keys only. Live keys are refused.');
-  }
-  const url = new URL(apiBaseUrl);
-  if (
-    url.origin !== 'https://api-sandbox.openborderpayments.com' ||
-    url.pathname !== '/' ||
-    url.search ||
-    url.hash ||
-    url.username ||
-    url.password
-  ) {
-    throw new Error('OB_API_URL must target the exact production Sandbox API.');
-  }
+  assertTestCredentials(secretKey, publishableKey);
+  assertSandboxApiUrl(apiBaseUrl);
   if (!databaseUrl || !webhookSecret || !referenceSecret) {
     throw new Error(
       'Configured demo readiness requires durable storage and webhook prerequisites.',
@@ -697,17 +711,10 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
     throw new Error('ORDER_REFERENCE_HMAC_SECRET must contain at least 32 characters.');
   }
 
-  const fetchWithTimeout: typeof fetch = (input, init = {}) =>
-    fetch(input, { ...init, signal: init.signal ?? AbortSignal.timeout(10_000) });
-
-  const client = new OpenBorderClient({
-    apiKey: secretKey,
-    baseUrl: apiBaseUrl,
-    fetch: fetchWithTimeout,
-  });
+  const client = options.gateway ?? createOpenBorderClient(secretKey!, apiBaseUrl);
   const sql = postgres(databaseUrl, { max: 1, prepare: false });
   return createApp(
-    { publishableKey, apiBaseUrl, transactionCap },
+    { publishableKey: publishableKey!, apiBaseUrl, transactionCap },
     client,
     referenceSecret,
     {
@@ -716,6 +723,45 @@ export function createConfiguredApp(env: NodeJS.ProcessEnv = process.env) {
       referenceSecret,
     },
   );
+}
+
+function assertTestCredentials(
+  secretKey: string | undefined,
+  publishableKey: string | undefined,
+): void {
+  if (!secretKey || !publishableKey) {
+    throw new Error('Configured demo readiness requires Test credentials.');
+  }
+  if (secretKey.includes('...') || publishableKey.includes('...')) {
+    throw new Error('Replace the placeholder Test credentials before starting the demo.');
+  }
+  if (!secretKey.startsWith('sk_test_') || !publishableKey.startsWith('pk_test_')) {
+    throw new Error('This public demo accepts Open Border test keys only. Live keys are refused.');
+  }
+}
+
+function assertSandboxApiUrl(apiBaseUrl: string): void {
+  const url = new URL(apiBaseUrl);
+  if (
+    url.origin !== 'https://api-sandbox.openborderpayments.com' ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.hash ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error('OB_API_URL must target the exact production Sandbox API.');
+  }
+}
+
+function createOpenBorderClient(secretKey: string, apiBaseUrl: string): OpenBorderGateway {
+  const fetchWithTimeout: typeof fetch = (input, init = {}) =>
+    fetch(input, { ...init, signal: init.signal ?? AbortSignal.timeout(10_000) });
+  return new OpenBorderClient({
+    apiKey: secretKey,
+    baseUrl: apiBaseUrl,
+    fetch: fetchWithTimeout,
+  });
 }
 
 function readTransactionCap(value: string | undefined): number {
