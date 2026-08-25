@@ -1090,7 +1090,7 @@
         </nav>
         <div class="nav-right">
           <span class="select-shell">
-            <select class="ccy-select" id="nav-ccy" aria-label="Currency">
+            <select class="ccy-select" id="nav-ccy" aria-label="Charge currency">
               <option value="USD">🌎 USD</option>
               <option value="GBP">🌍 GBP</option>
               <option value="EUR">🌍 EUR</option>
@@ -1111,8 +1111,8 @@
           <p class="eyebrow">New season · Ships worldwide</p>
           <h1>Everyday essentials, shipped across borders.</h1>
           <p class="sub">
-            One checkout, five currencies. Pick your currency and pay locally — we handle the
-            duties, taxes, and the rest.
+            Pick a charge currency for prices and payment. Your ship-to destination separately
+            determines duties and taxes.
           </p>
           <button class="btn-primary" id="hero-cta" type="button">Shop the collection →</button>
         </div>
@@ -1163,7 +1163,7 @@
 
             <div class="buy-row">
               <label class="field">
-                Currency
+                Charge currency
                 <span class="select-shell">
                   <select class="ccy-select" id="pdp-ccy" aria-label="Charge currency">
                     <option value="USD">USD</option>
@@ -1264,7 +1264,9 @@
               </select>
             </span>
           </label>
-          <span class="ccy-hint">Changing this reloads the card form on the new entity.</span>
+          <span class="ccy-hint"
+            >Sets displayed prices and payment routing; it does not determine duties or taxes.</span
+          >
         </div>
 
         <section class="checkout-section">
@@ -1277,9 +1279,9 @@
             <label class="stack">Postal code<input id="postal_code" type="text" placeholder="94105" required /></label>
           </div>
           <label class="stack"
-            >Country
+            >Ship-to destination
             <span class="select-shell">
-              <select id="country" required>
+              <select id="country" aria-describedby="destination-hint" required>
                 <option value="US" selected>United States (domestic)</option>
                 <option value="GB">United Kingdom</option>
                 <option value="CA">Canada</option>
@@ -1292,6 +1294,9 @@
                 <option value="SG">Singapore</option>
               </select>
             </span>
+            <span class="ccy-hint" id="destination-hint"
+              >This destination determines duties and taxes, independently of charge currency.</span
+            >
           </label>
         </section>
 

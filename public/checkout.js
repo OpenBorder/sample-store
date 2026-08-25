@@ -2,6 +2,18 @@
 // The shopper's currency determines the settlement region without exposing internal routing IDs.
 const ROUTE = { USD: 'United States', GBP: 'United Kingdom', EUR: 'Europe', CAD: 'Canada', AUD: 'Australia' };
 const CURRENCIES = ['USD', 'GBP', 'EUR', 'CAD', 'AUD'];
+const DESTINATIONS = {
+  US: 'United States',
+  GB: 'United Kingdom',
+  CA: 'Canada',
+  AU: 'Australia',
+  DE: 'Germany',
+  FR: 'France',
+  NL: 'Netherlands',
+  IE: 'Ireland',
+  JP: 'Japan',
+  SG: 'Singapore',
+};
 
 // Each product carries its HS (tariff) code; the server quotes duties & taxes from the code
 // + ship-to destination.
@@ -166,7 +178,7 @@ function renderPDP(product) {
   $('pdp-cat').textContent = product.cat;
   $('pdp-name').textContent = product.name;
   $('pdp-price').textContent = price(product.prices[ccy], ccy);
-  $('pdp-route').textContent = `Charged in ${ccy} · settlement region ${ROUTE[ccy]}`;
+  $('pdp-route').textContent = `Charge currency ${ccy} · payment routing ${ROUTE[ccy]}`;
   $('pdp-desc').textContent = product.desc;
   $('pdp-features').innerHTML = product.features.map((f) => `<li>${f}</li>`).join('');
   $('pdp-ccy').value = ccy;
@@ -241,7 +253,7 @@ function renderOrderSummary() {
   thumb.innerHTML = `<span class="summary-thumb-object" aria-hidden="true">${product.emoji}</span>`;
   thumb.style.background = `linear-gradient(135deg, ${product.grad[0]}, ${product.grad[1]})`;
   $('sum-name').textContent = product.name;
-  $('sum-meta').textContent = `${ccy} · ${ROUTE[ccy]}`;
+  $('sum-meta').textContent = `Charge currency ${ccy} · payment routing ${ROUTE[ccy]}`;
   $('sum-price').textContent = price(amount, ccy);
   receiptCard.hidden = true;
 }
@@ -277,11 +289,12 @@ async function refreshQuote() {
     }
     state.breakdown = data.amount_breakdown;
     state.quoteToken = data.quoteToken;
+    const destination = DESTINATIONS[$('country').value] || $('country').value;
     renderTotals(
       data.amount_breakdown,
       data.domestic
         ? 'Domestic order — no cross-border duties or taxes.'
-        : 'Duties & taxes quoted for your shipping destination.',
+        : `Duties & taxes quoted for ship-to destination ${destination}; charged in ${ccy}.`,
     );
     return true;
   } catch {
@@ -295,7 +308,10 @@ async function refreshQuote() {
 
 function updateDrawer() {
   renderOrderSummary();
-  renderTotals(null, 'Enter the final buyer details, then request one landed-cost quote.');
+  renderTotals(
+    null,
+    'Ship-to destination determines duties and taxes; charge currency sets displayed prices and payment routing.',
+  );
   renderPaymentPlaceholder('Review the final order total before entering payment details.');
   setQuoteAction(ob ? 'Review order total' : 'Checkout unavailable', !ob);
 }
