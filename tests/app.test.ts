@@ -155,6 +155,68 @@ test('tax quote uses the current closed trade-lane contract', async () => {
   ]);
 });
 
+test('Germany destination stays independent from USD through quote and payment mapping', async () => {
+  class GermanyUsdGateway extends FakeGateway {
+    override async createTaxQuote(
+      input: Parameters<OpenBorderGateway['createTaxQuote']>[0],
+    ): Promise<TaxQuoteResponse> {
+      this.quoteCalls += 1;
+      this.quoteInputs.push(input);
+      return {
+        ...quote,
+        destination_country: 'DE',
+        currency: 'USD',
+        amount_breakdown: {
+          subtotal: 4200,
+          shipping: 0,
+          tax: 798,
+          duty: 210,
+          total: 5208,
+          currency: 'USD',
+        },
+      };
+    }
+  }
+
+  const gateway = new GermanyUsdGateway();
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 1 },
+    gateway,
+    'unit-test-signing-secret',
+  );
+  const germanyUsdInput = {
+    ...baseInput,
+    currency: 'USD' as const,
+    amount: 4200,
+    address: {
+      ...baseInput.address,
+      line1: '1 Teststrasse',
+      city: 'Berlin',
+      postal_code: '10115',
+      country: 'DE',
+    },
+  };
+
+  const quoted = await request(app).post('/quote').send(germanyUsdInput).expect(200);
+  await request(app)
+    .post('/charge')
+    .send({
+      ...germanyUsdInput,
+      quoteToken: quoted.body.quoteToken,
+      paymentMethodId: 'pm_test_germany_usd',
+    })
+    .expect(200);
+
+  assert.equal(gateway.quoteInputs[0]?.destination_country, 'DE');
+  assert.equal(gateway.quoteInputs[0]?.currency, 'USD');
+  assert.equal(gateway.quoteInputs[0]?.line_items[0]?.unit_amount, 4200);
+  assert.equal(gateway.paymentCalls[0]?.input.currency, 'USD');
+  assert.equal(gateway.paymentCalls[0]?.input.amount, 4200);
+  assert.equal(gateway.paymentCalls[0]?.input.shipping_address.country, 'DE');
+  assert.equal(gateway.paymentCalls[0]?.input.billing_address.country, 'DE');
+  assert.equal(gateway.paymentCalls[0]?.input.tax_quote_id, 'tq_test_123');
+});
+
 test('quote fails closed before tax provider I/O without trusted Custom API provenance', async () => {
   const { app, gateway } = createTestApp();
   gateway.demoStore = 'medusa';

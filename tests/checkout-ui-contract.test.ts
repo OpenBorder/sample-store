@@ -54,6 +54,13 @@ interface MountedPaymentOptions {
   onSuccess(input: { paymentMethodId: string }): Promise<void>;
 }
 
+interface CheckoutRequestBody {
+  checkoutId?: string;
+  currency?: string;
+  amount?: number;
+  address?: { country?: string };
+}
+
 function createCheckoutRuntime(
   source: string,
   fetch: (url: string, init?: { body?: string }) => Promise<FakeResponse>,
@@ -130,6 +137,10 @@ test('the public drawer requests a quote only after an explicit final-total acti
   const manifest = JSON.parse(manifestSource) as { dependencies: Record<string, string> };
 
   assert.match(page, /id="review-total"[^>]*type="button"/);
+  assert.match(page, /Charge currency/);
+  assert.match(page, /Ship-to destination/);
+  assert.match(page, /does not determine duties or taxes/);
+  assert.match(page, /determines duties and taxes/);
   assert.match(
     page,
     new RegExp(
@@ -151,6 +162,57 @@ test('the public drawer requests a quote only after an explicit final-total acti
   const buyerChange = script.match(/function onBuyerDetailChange\(\) \{([\s\S]*?)\n\}/)?.[1] ?? '';
   assert.doesNotMatch(updateDrawer, /refreshQuote/);
   assert.doesNotMatch(buyerChange, /refreshQuote/);
+});
+
+test('Germany ship-to destination and USD charge currency stay separate in quote and charge requests', async () => {
+  const source = await readFile(join(process.cwd(), 'public/checkout.js'), 'utf8');
+  const quoteBodies: CheckoutRequestBody[] = [];
+  const chargeBodies: CheckoutRequestBody[] = [];
+  const runtime = createCheckoutRuntime(source, async (url, init) => {
+    const body = JSON.parse(init?.body ?? '{}') as CheckoutRequestBody;
+    if (url === '/quote') {
+      quoteBodies.push(body);
+      return {
+        json: async () => ({
+          ok: true,
+          domestic: false,
+          quoteToken: 'germany-usd.browser-contract',
+          amount_breakdown: {
+            subtotal: 4200,
+            shipping: 0,
+            tax: 798,
+            duty: 210,
+            total: 5208,
+            currency: 'USD',
+          },
+        }),
+      };
+    }
+    assert.equal(url, '/charge');
+    chargeBodies.push(body);
+    return { json: async () => ({ ok: true, status: 'payment_submitted' }) };
+  });
+
+  await openCompletedBuyerForm(runtime.element);
+  runtime.element('country').value = 'DE';
+  await runtime.element('country').dispatch('change');
+  await runtime.element('review-total').dispatch('click');
+  await runtime.mountedPayment().onSuccess({ paymentMethodId: 'pm_germany_usd_contract' });
+
+  assert.equal(quoteBodies.length, 1);
+  assert.equal(quoteBodies[0]?.checkoutId, 'checkout-3');
+  assert.equal(quoteBodies[0]?.currency, 'USD');
+  assert.equal(quoteBodies[0]?.amount, 4200);
+  assert.equal(quoteBodies[0]?.address?.country, 'DE');
+  assert.equal(
+    runtime.element('totals-note').textContent,
+    'Duties & taxes quoted for ship-to destination Germany; charged in USD.',
+  );
+  assert.equal(chargeBodies.length, 1);
+  assert.equal(chargeBodies[0]?.checkoutId, quoteBodies[0]?.checkoutId);
+  assert.equal(chargeBodies[0]?.currency, 'USD');
+  assert.equal(chargeBodies[0]?.amount, 4200);
+  assert.equal(chargeBodies[0]?.address?.country, 'DE');
 });
 
 test('an in-flight quote locks all controls and rejects a stale response after a forced edit', async () => {
