@@ -124,6 +124,20 @@ test('config endpoint exposes only the publishable key', async () => {
   assert.equal(response.headers['cache-control'], 'no-store');
 });
 
+test('a buyer who gives no postal code sends no destination_postal_code at all', async () => {
+  const { app, gateway } = createTestApp();
+
+  await request(app)
+    .post('/quote')
+    .send({ ...baseInput, address: { line1: '1 High Street', city: 'London', country: 'GB' } })
+    .expect(200);
+
+  // An empty string would bind the quote to a detail nobody supplied, and the API treats a
+  // blank region/postal code as absent anyway — so the key must not be present.
+  assert.equal(gateway.quoteInputs.length, 1);
+  assert.ok(!('destination_postal_code' in gateway.quoteInputs[0]!));
+});
+
 test('catalog tampering is rejected before an upstream request', async () => {
   const { app, gateway } = createTestApp();
   const response = await request(app).post('/quote').send({ ...baseInput, amount: 1 }).expect(400);
@@ -140,6 +154,7 @@ test('tax quote uses the current closed trade-lane contract', async () => {
   assert.deepEqual(gateway.quoteInputs, [
     {
       destination_country: 'GB',
+      destination_postal_code: 'SW1A 1AA',
       ship_from_country: 'US',
       currency: 'GBP',
       line_items: [

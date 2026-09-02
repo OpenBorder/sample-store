@@ -48,6 +48,16 @@ const CATALOG = {
 type ProductId = keyof typeof CATALOG;
 type Currency = keyof (typeof CATALOG)['hoodie']['prices'];
 
+/**
+ * `destination_postal_code` is accepted by the API but is not in `@open-border/node@0.9.5`,
+ * which predates it. The SDK serializes whatever it is given, so the field reaches the API
+ * through this widened type. Drop the widening once the published SDK carries the field.
+ */
+type TaxQuoteInputWithDestinationDetail = Parameters<OpenBorderClient['createTaxQuote']>[0] & {
+  destination_postal_code?: string;
+  destination_region?: string;
+};
+
 export interface OpenBorderGateway {
   getCheckoutConfig(
     input: Parameters<OpenBorderClient['getCheckoutConfig']>[0],
@@ -477,11 +487,20 @@ export function createApp(
       }
       const quote = await client.createTaxQuote({
         destination_country: input.address.country,
+        // US states and CA provinces carry the whole tax rate, so the API refuses a quote
+        // priced on the country alone there — it requires a region or a postal code. The
+        // postal code resolves it; Open Border infers the state/province from it. Sent from
+        // the SAME value the charge's shipping address uses, because the quote is bound to
+        // it: a quote priced for one state cannot price a sale in another. Omitted entirely
+        // when the buyer gave none, rather than sent empty.
+        ...(input.address.postal_code
+          ? { destination_postal_code: input.address.postal_code }
+          : {}),
         ship_from_country: 'US',
         currency: input.currency,
         line_items: lineItemsFor(input, product.hsCode),
         ...(input.email ? { customer: { email: input.email } } : {}),
-      });
+      } as TaxQuoteInputWithDestinationDetail);
       const parsedExpiry = Date.parse(quote.expires_at);
       const expiresAt = Number.isFinite(parsedExpiry)
         ? Math.min(parsedExpiry, Date.now() + 15 * 60_000)
