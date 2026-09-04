@@ -682,7 +682,7 @@ export function createConfiguredApp(
 
   if (options.runtime === 'local-tutorial') {
     assertTestCredentials(secretKey, publishableKey);
-    assertSandboxApiUrl(apiBaseUrl);
+    resolveApiTarget(apiBaseUrl);
     const client = options.gateway ?? createOpenBorderClient(secretKey!, apiBaseUrl);
     const signingSecret = createHash('sha256')
       .update(`local-tutorial\0${secretKey}`)
@@ -728,7 +728,7 @@ export function createConfiguredApp(
   }
 
   assertTestCredentials(secretKey, publishableKey);
-  assertSandboxApiUrl(apiBaseUrl);
+  const apiTarget = resolveApiTarget(apiBaseUrl);
   if (!databaseUrl || !webhookSecret || !referenceSecret) {
     throw new Error(
       'Configured demo readiness requires durable storage and webhook prerequisites.',
@@ -744,7 +744,15 @@ export function createConfiguredApp(
   const client = options.gateway ?? createOpenBorderClient(secretKey!, apiBaseUrl);
   const sql = postgres(databaseUrl, { max: 1, prepare: false });
   return createApp(
-    { publishableKey: publishableKey!, apiBaseUrl, transactionCap },
+    {
+      publishableKey: publishableKey!,
+      apiBaseUrl,
+      transactionCap,
+      // Only the demo stage can issue the `custom_api` attestation, so requiring it against
+      // any other host would close `/quote` and `/charge` permanently. The requirement
+      // follows the host rather than a separate switch, so the two cannot disagree.
+      requireTrustedDemoProvenance: apiTarget.attestsDemoProvenance,
+    },
     client,
     referenceSecret,
     {
@@ -770,18 +778,44 @@ function assertTestCredentials(
   }
 }
 
-function assertSandboxApiUrl(apiBaseUrl: string): void {
+/**
+ * The Open Border API hosts this store may talk to, and whether each one can attest the
+ * store's public-demo provenance.
+ *
+ * `demo_store: 'custom_api'` is issued ONLY by the demo stage — the API refuses that
+ * configuration on any other stage — so a store pointed at staging cannot prove its
+ * provenance and must not be asked to. Provenance therefore follows the HOST and is
+ * resolved here, in one place, rather than from a second variable that could contradict
+ * the host it is meant to describe.
+ *
+ * Widening this map is the only way to reach a new API host, and every entry is still a
+ * Test-rail host: `assertTestCredentials` independently refuses live keys, so no entry
+ * here can put this store on live money.
+ */
+const SUPPORTED_API_ORIGINS: Record<string, { attestsDemoProvenance: boolean }> = {
+  'https://api-sandbox.openborderpayments.com': { attestsDemoProvenance: true },
+  'https://api-staging.openborderpayments.com': { attestsDemoProvenance: false },
+};
+
+/**
+ * Resolves `OB_API_URL` to a supported host, rejecting anything else. The origin must
+ * match exactly and carry no path, query, fragment or credentials — a URL that merely
+ * starts with a supported origin is not the same host.
+ */
+function resolveApiTarget(apiBaseUrl: string): { attestsDemoProvenance: boolean } {
   const url = new URL(apiBaseUrl);
+  const target = SUPPORTED_API_ORIGINS[url.origin];
   if (
-    url.origin !== 'https://api-sandbox.openborderpayments.com' ||
+    !target ||
     url.pathname !== '/' ||
     url.search ||
     url.hash ||
     url.username ||
     url.password
   ) {
-    throw new Error('OB_API_URL must target the exact production Sandbox API.');
+    throw new Error('OB_API_URL must target the exact Open Border Sandbox or staging API.');
   }
+  return target;
 }
 
 function createOpenBorderClient(secretKey: string, apiBaseUrl: string): OpenBorderGateway {

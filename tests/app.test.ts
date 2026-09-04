@@ -969,7 +969,7 @@ test('capped public demo startup refuses live, mixed, and unsafe custom endpoint
         OB_PUBLISHABLE_KEY: 'pk_test_example',
         OB_API_URL: 'https://api-demo.openborderpayments.com',
       }),
-    /exact production Sandbox API/,
+    /Sandbox or staging API/,
   );
   assert.throws(
     () =>
@@ -997,7 +997,7 @@ test('capped public demo startup refuses live, mixed, and unsafe custom endpoint
         OB_PUBLISHABLE_KEY: 'pk_test_example',
         OB_API_URL: 'https://api.openborderpayments.com',
       }),
-    /exact production Sandbox API/,
+    /Sandbox or staging API/,
   );
   assert.throws(
     () =>
@@ -1005,10 +1005,51 @@ test('capped public demo startup refuses live, mixed, and unsafe custom endpoint
         DEMO_TRANSACTION_CAP: '1',
         OB_SECRET_KEY: `sk_test_${'x'.repeat(24)}`,
         OB_PUBLISHABLE_KEY: 'pk_test_example',
-        OB_API_URL: 'https://api-staging.openborderpayments.com',
+        // A supported origin is still only that origin: a path makes it a different target.
+        OB_API_URL: 'https://api-staging.openborderpayments.com/v1',
       }),
-    /exact production Sandbox API/,
+    /Sandbox or staging API/,
   );
+});
+
+const stagingEnv = {
+  VERCEL_ENV: 'production',
+  DEMO_TRANSACTION_CAP: '50',
+  OB_SECRET_KEY: 'sk_test_example',
+  OB_PUBLISHABLE_KEY: 'pk_test_example',
+  DATABASE_URL: 'postgres://example.invalid/sample_store',
+  OB_WEBHOOK_SECRET: 'whsec_example',
+  ORDER_REFERENCE_HMAC_SECRET: 'r'.repeat(32),
+};
+
+test('a staging target boots with transactions on and demo provenance not required', async () => {
+  const app = createConfiguredApp({
+    ...stagingEnv,
+    OB_API_URL: 'https://api-staging.openborderpayments.com',
+  });
+
+  const health = await request(app).get('/health').expect(200);
+
+  // Only the demo stage issues the `custom_api` attestation, so requiring it here would
+  // close /quote and /charge permanently. /health states the relaxation rather than hiding it.
+  assert.equal(health.body.transactionsEnabled, true);
+  assert.equal(health.body.trustedDemoProvenanceRequired, false);
+  assert.match(
+    (await request(app).get('/config.js').expect(200)).text,
+    /api-staging\.openborderpayments\.com/,
+  );
+});
+
+test('a sandbox target still requires demo provenance', async () => {
+  const app = createConfiguredApp({
+    ...stagingEnv,
+    OB_API_URL: 'https://api-sandbox.openborderpayments.com',
+  });
+
+  const health = await request(app).get('/health').expect(200);
+
+  // Absent from the body means "required" — the field appears only when it is relaxed.
+  assert.equal(Object.hasOwn(health.body, 'trustedDemoProvenanceRequired'), false);
 });
 
 test('a card the issuer wants authenticated hands the embed its continuation', async () => {

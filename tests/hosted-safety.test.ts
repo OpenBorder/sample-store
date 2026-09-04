@@ -550,6 +550,8 @@ test('production starts at zero cap without credentials and enabling requires ev
   const health = await request(disabled).get('/health').expect(200);
   assert.equal(health.body.transactionsEnabled, false);
 
+  // Keys and a supported host are not enough: durable storage and the webhook
+  // prerequisites are still required before a capped demo will open.
   assert.throws(
     () =>
       createConfiguredApp({
@@ -559,7 +561,20 @@ test('production starts at zero cap without credentials and enabling requires ev
         OB_SECRET_KEY: 'sk_test_example',
         OB_PUBLISHABLE_KEY: 'pk_test_example',
       }),
-    /exact production Sandbox API/,
+    /requires durable storage and webhook prerequisites/,
+  );
+
+  // And an unsupported host is refused before any prerequisite is considered.
+  assert.throws(
+    () =>
+      createConfiguredApp({
+        VERCEL_ENV: 'production',
+        DEMO_TRANSACTION_CAP: '1',
+        OB_API_URL: 'https://api-demo.openborderpayments.com',
+        OB_SECRET_KEY: 'sk_test_example',
+        OB_PUBLISHABLE_KEY: 'pk_test_example',
+      }),
+    /Sandbox or staging API/,
   );
 });
 
