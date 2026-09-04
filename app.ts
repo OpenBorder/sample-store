@@ -409,6 +409,7 @@ export function createApp(
           webhookSecret: options.webhookSecret!,
           referenceSecret: options.referenceSecret!,
           store,
+          requireDemoProvenance: trustedDemoProvenanceRequired,
         })
       : (_req, res) =>
           res.status(503).json({ ok: false, code: 'demo_not_enabled' }),
