@@ -12,6 +12,19 @@ export function createWebhookReceiver(options: {
   readonly webhookSecret: string;
   readonly referenceSecret: string;
   readonly store: OrderStore;
+  /**
+   * Whether a terminal event must carry the `custom_api` demo attestation to be acted on.
+   *
+   * Only the demo stage issues it, so against any other API host every terminal event would
+   * be dropped and no order could EVER reconcile — which reads exactly like an abandoned
+   * payment and strands the checkout permanently. Passed in from the same host-derived value
+   * `/quote` and `/charge` gate on, so the request path and the webhook path cannot disagree
+   * about whether this deployment can observe provenance at all.
+   *
+   * The `mode: 'test'` check is NOT conditional and never becomes so: that one keeps live
+   * money off this store regardless of host.
+   */
+  readonly requireDemoProvenance: boolean;
   readonly now?: () => number;
 }): RequestHandler {
   const now = options.now ?? Date.now;
@@ -42,7 +55,7 @@ export function createWebhookReceiver(options: {
       return;
     }
 
-    const event = readTerminalEvent(rawBody);
+    const event = readTerminalEvent(rawBody, options.requireDemoProvenance);
     if (event) {
       try {
         await options.store.purgeDeliveriesBefore(
@@ -101,7 +114,10 @@ function validSignature(
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
-function readTerminalEvent(rawBody: Buffer): {
+function readTerminalEvent(
+  rawBody: Buffer,
+  requireDemoProvenance: boolean,
+): {
   paymentIntentId: string;
   orderStatus: Extract<OrderStatus, 'paid' | 'payment_failed'>;
   occurredAt: Date;
@@ -114,7 +130,7 @@ function readTerminalEvent(rawBody: Buffer): {
       data?: { paymentIntentId?: unknown; demoStore?: unknown };
     };
     if (event.mode !== 'test') return null;
-    if (event.data?.demoStore !== 'custom_api') return null;
+    if (requireDemoProvenance && event.data?.demoStore !== 'custom_api') return null;
     const paymentIntentId = event.data?.paymentIntentId;
     if (typeof paymentIntentId !== 'string' || !paymentIntentId) return null;
     if (typeof event.occurredAt !== 'string') return null;

@@ -498,6 +498,123 @@ test('signed Test events with missing or foreign demo provenance are not staged'
   assert.equal(store.deliveryCount(), 0);
 });
 
+/**
+ * The counterpart to the provenance test above. Only the demo stage issues the `custom_api`
+ * attestation, so a deployment pointed at any other API host can never observe it — and
+ * requiring it there would drop EVERY terminal event, leaving the order stranded in
+ * `payment_submitted` forever and (via the single-active-checkout lock) closing the store.
+ */
+test('with provenance not required, a terminal event without demo provenance reconciles', async () => {
+  const store = createMemoryOrderStore();
+  const webhookSecret = 'whsec_test_receiver';
+  const referenceSecret = 'private-reference-secret-for-tests';
+  const app = createApp(
+    {
+      publishableKey: 'pk_test_public_example',
+      transactionCap: 50,
+      requireTrustedDemoProvenance: false,
+    },
+    new Gateway(),
+    'quote-signing-secret-for-tests',
+    { store, referenceSecret, webhookSecret },
+  );
+  await store.createOrGetWithinCap(
+    {
+      checkoutId,
+      idempotencyKey: 'stable-key',
+      status: 'awaiting_payment',
+      productId: 'hoodie',
+      amount: 3400,
+      currency: 'GBP',
+    },
+    50,
+  );
+  const paymentIntentId = 'provider_reference_must_stay_private';
+  await store.attachPaymentReference(
+    checkoutId,
+    hashPrivateReference(referenceSecret, paymentIntentId),
+  );
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const delivery = 'delivery_no_provenance_reconciles';
+  const body = JSON.stringify({
+    type: 'payment_intent.succeeded',
+    mode: 'test',
+    occurredAt: new Date(Number(timestamp) * 1000).toISOString(),
+    data: { paymentIntentId },
+  });
+  const signature = createHmac('sha256', webhookSecret)
+    .update(`${timestamp}.${delivery}.${body}`)
+    .digest('hex');
+
+  await request(app)
+    .post('/webhooks/openborder')
+    .set('Content-Type', 'application/json')
+    .set('OpenBorder-Webhook-Id', delivery)
+    .set('OpenBorder-Webhook-Timestamp', timestamp)
+    .set('OpenBorder-Webhook-Signature', `v1=${signature},t=${timestamp}`)
+    .send(body)
+    .expect(204);
+
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal(store.deliveryCount(), 1);
+});
+
+test('relaxing provenance never relaxes the test-mode guard', async () => {
+  const store = createMemoryOrderStore();
+  const webhookSecret = 'whsec_test_receiver';
+  const referenceSecret = 'private-reference-secret-for-tests';
+  const app = createApp(
+    {
+      publishableKey: 'pk_test_public_example',
+      transactionCap: 50,
+      requireTrustedDemoProvenance: false,
+    },
+    new Gateway(),
+    'quote-signing-secret-for-tests',
+    { store, referenceSecret, webhookSecret },
+  );
+  await store.createOrGetWithinCap(
+    {
+      checkoutId,
+      idempotencyKey: 'stable-key',
+      status: 'awaiting_payment',
+      productId: 'hoodie',
+      amount: 3400,
+      currency: 'GBP',
+    },
+    50,
+  );
+  const paymentIntentId = 'provider_reference_must_stay_private';
+  await store.attachPaymentReference(
+    checkoutId,
+    hashPrivateReference(referenceSecret, paymentIntentId),
+  );
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const delivery = 'delivery_live_mode_still_refused';
+  // A LIVE-mode event, correctly signed. Provenance is relaxed; this must still not apply.
+  const body = JSON.stringify({
+    type: 'payment_intent.succeeded',
+    mode: 'live',
+    occurredAt: new Date(Number(timestamp) * 1000).toISOString(),
+    data: { paymentIntentId },
+  });
+  const signature = createHmac('sha256', webhookSecret)
+    .update(`${timestamp}.${delivery}.${body}`)
+    .digest('hex');
+
+  await request(app)
+    .post('/webhooks/openborder')
+    .set('Content-Type', 'application/json')
+    .set('OpenBorder-Webhook-Id', delivery)
+    .set('OpenBorder-Webhook-Timestamp', timestamp)
+    .set('OpenBorder-Webhook-Signature', `v1=${signature},t=${timestamp}`)
+    .send(body)
+    .expect(204);
+
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_submitted');
+  assert.equal(store.deliveryCount(), 0);
+});
+
 test('an owned signed webhook returns retryable failure when durable staging fails', async () => {
   const baseStore = createMemoryOrderStore();
   const store = {
