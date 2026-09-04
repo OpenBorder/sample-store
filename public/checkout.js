@@ -496,6 +496,15 @@ function mountEmbed() {
           '</dl>' +
           `<p class="request-ref">Retry-safe checkout ${escapeHtml(state.checkoutId.slice(0, 8))}</p>`,
       );
+      // Hand the charge's outcome back to the embed. A card the issuer wants
+      // authenticated (3DS/SCA) is authenticated by the embed itself from this pair, so
+      // this page carries no payment-processor code and never names a provider. Passed
+      // unconditionally: the embed treats anything that is not an outstanding
+      // `requires_action` as nothing left to do, so there is no branch to keep in step
+      // here. A challenge that fails arrives at `onError` below, which replaces the
+      // receipt — and the receipt above stays true either way, because the order really
+      // does remain pending until a terminal webhook reconciles it.
+      return { status: data.paymentStatus, client_secret: data.clientSecret };
     },
     onError: (message) =>
       renderReceipt('err', `<h4>Payment failed</h4><p>${escapeHtml(message)}</p>`),

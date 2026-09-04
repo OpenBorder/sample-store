@@ -99,6 +99,26 @@ class UniquePaymentGateway extends FakeGateway {
   }
 }
 
+/**
+ * An issuer that wants the card authenticated: the intent comes back `requires_action`
+ * with the credential that completes it. The secret is deliberately NOT built from
+ * `paymentIntent.id` — a client secret names the PROCESSOR's intent, never the Open
+ * Border one, and the no-leak assertions below depend on the two staying distinct.
+ */
+class ChallengeGateway extends FakeGateway {
+  override async createPaymentIntent(
+    input: Parameters<OpenBorderGateway['createPaymentIntent']>[0],
+    options: { idempotencyKey: string },
+  ) {
+    this.paymentCalls.push({ input, key: options.idempotencyKey });
+    return {
+      ...paymentIntent,
+      status: 'requires_action',
+      client_secret: 'ps_challenge_secret_example',
+    };
+  }
+}
+
 const createTestApp = (gateway = new FakeGateway()) => ({
   app: createApp(
     { publishableKey: 'pk_test_public_example', transactionCap: 1 },
@@ -989,4 +1009,36 @@ test('capped public demo startup refuses live, mixed, and unsafe custom endpoint
       }),
     /exact production Sandbox API/,
   );
+});
+
+test('a card the issuer wants authenticated hands the embed its continuation', async () => {
+  const { app } = createTestApp(new ChallengeGateway());
+  const quoteToken = await getQuoteToken(app);
+
+  const response = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  // The embed performs the challenge from exactly this pair, so both halves must travel.
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.paymentStatus, 'requires_action');
+  assert.equal(response.body.clientSecret, 'ps_challenge_secret_example');
+  // The continuation is not a licence to leak the Open Border intent id or the entity.
+  assert.doesNotMatch(JSON.stringify(response.body), /pi_test_123|obmor_uk/);
+});
+
+test('a settled charge sends no client secret at all', async () => {
+  const { app } = createTestApp();
+  const quoteToken = await getQuoteToken(app);
+
+  const response = await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+
+  // Nothing is outstanding, so the credential is absent rather than null — a browser that
+  // hands this back gives the embed nothing to do.
+  assert.equal(response.body.paymentStatus, 'succeeded');
+  assert.equal(Object.hasOwn(response.body, 'clientSecret'), false);
 });

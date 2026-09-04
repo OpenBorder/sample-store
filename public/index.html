@@ -1192,7 +1192,9 @@
                     authenticated with the <strong>publishable</strong> key (<code>pk_</code>). It
                     collects the card and returns a token (<code>pm_</code>). The
                     <strong>product currency you pick above</strong> tells it which Open Border entity
-                    to route to.
+                    to route to. If the issuer wants the card <strong>authenticated</strong>
+                    (3DS/SCA), the embed also performs that step itself — our server just hands the
+                    charge's response back to it, so this page carries no payment-processor code.
                   </li>
                   <li>
                     <span class="ob-tag">@open-border/node</span> — the backend SDK. Our server takes
@@ -1327,7 +1329,7 @@
     </aside>
 
     <script src="/config.js"></script>
-    <script src="https://unpkg.com/@open-border/js@0.9.5"></script>
+    <script src="https://unpkg.com/@open-border/js@0.9.7"></script>
     <script src="/checkout.js"></script>
   </body>
 </html>
