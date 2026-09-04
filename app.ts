@@ -48,16 +48,6 @@ const CATALOG = {
 type ProductId = keyof typeof CATALOG;
 type Currency = keyof (typeof CATALOG)['hoodie']['prices'];
 
-/**
- * `destination_postal_code` is accepted by the API but is not in `@open-border/node@0.9.5`,
- * which predates it. The SDK serializes whatever it is given, so the field reaches the API
- * through this widened type. Drop the widening once the published SDK carries the field.
- */
-type TaxQuoteInputWithDestinationDetail = Parameters<OpenBorderClient['createTaxQuote']>[0] & {
-  destination_postal_code?: string;
-  destination_region?: string;
-};
-
 export interface OpenBorderGateway {
   getCheckoutConfig(
     input: Parameters<OpenBorderClient['getCheckoutConfig']>[0],
@@ -500,7 +490,7 @@ export function createApp(
         currency: input.currency,
         line_items: lineItemsFor(input, product.hsCode),
         ...(input.email ? { customer: { email: input.email } } : {}),
-      } as TaxQuoteInputWithDestinationDetail);
+      });
       const parsedExpiry = Date.parse(quote.expires_at);
       const expiresAt = Number.isFinite(parsedExpiry)
         ? Math.min(parsedExpiry, Date.now() + 15 * 60_000)
@@ -654,6 +644,17 @@ export function createApp(
         ok: true,
         checkoutId: input.checkoutId,
         status: 'payment_submitted',
+        // A card the issuer wants authenticated (3DS/SCA) comes back `requires_action`,
+        // and the buyer still has a step to take. The embed performs it when the browser
+        // hands this pair back, so the two fields travel together or not at all. The
+        // client secret is publishable by design — it can only complete THIS payment and
+        // moves no money on its own — but it is still only sent when a challenge is
+        // actually outstanding, and it never reveals the Open Border intent id that
+        // `attachPaymentReference` above deliberately keeps hashed.
+        paymentStatus: paymentIntent.status,
+        ...(paymentIntent.status === 'requires_action' && paymentIntent.client_secret
+          ? { clientSecret: paymentIntent.client_secret }
+          : {}),
       });
     } catch (error) {
       sendError(res, error);
