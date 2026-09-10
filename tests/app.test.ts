@@ -1215,7 +1215,7 @@ test('a terminal webhook still reconciles a checkout whose claim was reclaimed',
   );
 });
 
-test('a reclaimed checkout is closed rather than resumed, and /health reports the claim age', async () => {
+test('the stuck checkout\'s own retry reclaims it and is closed, not resumed', async () => {
   let now = new Date('2026-09-04T12:00:00.000Z');
   const gateway = new UniquePaymentGateway();
   const store = createMemoryOrderStore({ now: () => now });
@@ -1229,7 +1229,6 @@ test('a reclaimed checkout is closed rather than resumed, and /health reports th
       webhookSecret: 'whsec_test_receiver',
     },
   );
-  const secondInput = { ...baseInput, checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72' };
   const chargeBody = {
     ...baseInput,
     quoteToken: await getQuoteToken(app, baseInput),
@@ -1244,28 +1243,18 @@ test('a reclaimed checkout is closed rather than resumed, and /health reports th
   assert.equal(held.body.activeCheckoutAgeSeconds, 600);
   assert.equal(held.body.abandonCheckoutAfterSeconds, 900);
 
-  // Another shopper past the window takes the claim, which reclaims the stuck order.
+  // Past the window, this shopper's OWN retry is the repair — no second shopper has to
+  // come along for the store to heal. They are told to start a new checkout rather than
+  // submitting a second payment against an order that can no longer reconcile.
   now = new Date(now.getTime() + (900 + 1) * 1000);
-  await request(app)
-    .post('/charge')
-    .send({
-      ...secondInput,
-      quoteToken: await getQuoteToken(app, secondInput),
-      paymentMethodId: 'pm_test_4242',
-    })
-    .expect(200);
-
-  // Only now can the first shopper's own retry reach a reclaimed order, and it is told
-  // to start a new checkout rather than submitting against one that can never reconcile.
   const resumed = await request(app).post('/charge').send(chargeBody).expect(409);
   assert.equal(resumed.body.code, 'checkout_closed');
   assert.equal(resumed.body.checkoutClosed, true);
   assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'abandoned');
-  // The retry submitted no second payment for the reclaimed order.
-  assert.equal(gateway.paymentCalls.length, 2);
+  assert.equal(gateway.paymentCalls.length, 1);
 
-  // The claim now belongs to the live checkout, and its age is measured from it.
-  const reclaimed = await request(app).get('/health').expect(200);
-  assert.equal(reclaimed.body.activeCheckout, true);
-  assert.equal(reclaimed.body.activeCheckoutAgeSeconds, 0);
+  // The claim is released, so the store is open to the next checkout.
+  const released = await request(app).get('/health').expect(200);
+  assert.equal(released.body.activeCheckout, false);
+  assert.equal(released.body.activeCheckoutAgeSeconds, null);
 });
