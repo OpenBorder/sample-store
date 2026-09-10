@@ -27,7 +27,6 @@ test('local server starts with only Test keys and stays on loopback', async (con
       DEMO_TRANSACTION_CAP: '',
       OB_SECRET_KEY: 'sk_test_local_tutorial',
       OB_PUBLISHABLE_KEY: 'pk_test_local_tutorial',
-      DATABASE_URL: '',
       OB_WEBHOOK_SECRET: '',
       ORDER_REFERENCE_HMAC_SECRET: '',
     },

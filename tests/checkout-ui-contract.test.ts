@@ -359,8 +359,8 @@ test('a transient retry preflight keeps the original ambiguous payment method', 
         if (chargeBodies.length === 2) {
           return {
             ok: false,
-            code: 'demo_not_ready',
-            message: 'The durable checkout store is temporarily unavailable.',
+            code: 'demo_not_enabled',
+            message: 'The demo is temporarily unavailable.',
           };
         }
         return { ok: true, status: 'payment_submitted' };

@@ -6,8 +6,8 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
 
 - Open the local tutorial store at `http://127.0.0.1:4000` in a clean browser profile.
 - Confirm `/health` reports `local-tutorial`, cap `1`, zero usage, no active checkout, and
-  `trustedDemoProvenanceRequired: false`. It truthfully reports non-durable orders and no authentic
-  webhooks; do not describe the local tutorial as production-ready or reconciled.
+  `trustedDemoProvenanceRequired: false`. It truthfully reports no authentic webhooks; do not
+  describe the local tutorial as production-ready or reconciled.
 - Use a dedicated demo buyer and non-sensitive shipping address.
 - Open the production dashboard's **Sandbox Transactions** view in a second tab.
 - Hide bookmarks, notifications, environment settings, and all secret-key screens.
@@ -41,4 +41,4 @@ Target length: 5 minutes. Start with the working buyer flow, then explain the in
 ## Final sentence
 
 “This local tutorial uses the same Test API integration a developer can clone, with safe retries
-and one in-memory checkout; production requires durable orders and authentic reconciliation.”
+and one in-memory checkout; the hosted store adds authentic webhook reconciliation on top of it.”
