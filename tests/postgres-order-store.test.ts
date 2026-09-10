@@ -18,6 +18,7 @@ before(async () => {
       '001_durable_orders.sql',
       '002_daily_transaction_cap.sql',
       '003_webhook_reconciliation.sql',
+      '004_reclaim_abandoned_checkouts.sql',
     ]) {
       const contents = await readFile(join(process.cwd(), 'migrations', migration), 'utf8');
       await sql.unsafe(contents);
@@ -195,6 +196,7 @@ test(
         assert.equal((await restarted.getByCheckoutId(lastRaceCheckoutId))?.status, 'paid');
         assert.deepEqual(await restarted.getUsage(), {
           activeCheckout: false,
+          activeCheckoutAgeSeconds: null,
           transactionsUsedToday: 25,
         });
       } finally {
@@ -269,6 +271,85 @@ test(
       );
       assert.notEqual(nextDay, 'active_checkout');
       assert.notEqual(nextDay, 'cap_reached');
+    } finally {
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'PostgreSQL reclaims a stale claim once under concurrency, keeps the row, and still reconciles it',
+  { skip: databaseUrl ? false : 'PAY645_POSTGRES_TEST_URL is not configured' },
+  async () => {
+    const sql = postgres(databaseUrl!, { max: 8 });
+    try {
+      await sql`TRUNCATE sample_store_pending_webhooks, sample_store_webhook_deliveries, sample_store_orders`;
+      const store = createPostgresOrderStore(sql);
+      const order = (suffix: number): StoredOrder => ({
+        checkoutId: `20000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`,
+        idempotencyKey: `reclaim-key-${suffix}`,
+        status: 'awaiting_payment',
+        productId: 'hoodie',
+        amount: 3400,
+        currency: 'GBP',
+      });
+
+      // Arrange: a checkout that submitted payment and never reconciled — the state one
+      // unverified delivery left behind, which used to close the store until someone
+      // edited this table by hand.
+      const stranded = order(1);
+      assert.deepEqual(await store.createOrGetWithinCap(stranded, 50), stranded);
+      const strandedReference = 'private-stranded-reference-hash';
+      await store.attachPaymentReference(stranded.checkoutId, strandedReference);
+
+      // Inside the window the claim still holds, which is what a capped demo wants.
+      assert.equal(await store.createOrGetWithinCap(order(2), 50), 'active_checkout');
+      const held = await store.getUsage();
+      assert.equal(held.activeCheckout, true);
+      assert.ok((held.activeCheckoutAgeSeconds ?? -1) >= 0);
+
+      // Act: age it past the window, then race two admissions at the reclaim. Both run
+      // under the same advisory lock, so the claim is released once and handed to one.
+      await sql`
+        UPDATE sample_store_orders
+        SET updated_at = now() - interval '16 minutes'
+        WHERE checkout_id = ${stranded.checkoutId}
+      `;
+      const stale = await store.getUsage();
+      assert.ok((stale.activeCheckoutAgeSeconds ?? 0) > 15 * 60);
+      const raced = await Promise.all([
+        store.createOrGetWithinCap(order(3), 50),
+        store.createOrGetWithinCap(order(4), 50),
+      ]);
+
+      // Assert: exactly one winner — the real unique index admitted one row, and the
+      // loser was refused rather than erroring on it.
+      const admitted = raced.filter((result) => typeof result === 'object') as StoredOrder[];
+      assert.equal(admitted.length, 1);
+      assert.equal(raced.filter((result) => result === 'active_checkout').length, 1);
+
+      // The stranded row is retained and asserts no payment outcome.
+      const strandedRow = await store.getByCheckoutId(stranded.checkoutId);
+      assert.equal(strandedRow?.status, 'abandoned');
+      assert.equal(strandedRow?.amount, 3400);
+
+      // Its terminal delivery, arriving after the reclaim, still lands — `abandoned` is
+      // outside the claim predicate but not terminal.
+      assert.equal(
+        await store.applyWebhook({
+          deliveryHash: 'private-late-terminal-delivery',
+          paymentReferenceHash: strandedReference,
+          status: 'paid',
+          occurredAt: new Date('2026-09-04T13:00:00.000Z'),
+        }),
+        'applied',
+      );
+      assert.equal((await store.getByCheckoutId(stranded.checkoutId))?.status, 'paid');
+      // It reconciled the order owning that reference and left the live checkout alone.
+      assert.equal(
+        (await store.getByCheckoutId(admitted[0]!.checkoutId))?.status,
+        'awaiting_payment',
+      );
     } finally {
       await sql.end();
     }
