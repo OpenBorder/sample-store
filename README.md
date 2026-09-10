@@ -39,23 +39,23 @@ Browser (public pk_)                         Backend (secret sk_)
   The order and key are persisted before the payment request, so a lost browser response can be
   replayed without creating a second payment intent.
 - **Authentic Test-only terminal reconciliation.** Raw signed webhooks are timestamp-checked,
-  replay-safe, durably deduplicated, and projected onto the persisted order only when the signed
-  event declares Test mode. External delivery and payment references are stored only as keyed
-  hashes. An owned terminal event that wins the response/attachment race is staged during the
-  single active-checkout window, then consumed atomically when the payment reference attaches.
-  Pending evidence is short-lived and bounded, and terminal orders never regress on retries or
-  contradictory later deliveries.
+  replay-safe, deduplicated, and projected onto the order only when the signed event declares Test
+  mode. External delivery and payment references are stored only as keyed hashes. An owned terminal
+  event that wins the response/attachment race is staged during the single active-checkout window,
+  then consumed atomically when the payment reference attaches. Pending evidence is short-lived and
+  bounded, and terminal orders never regress on retries or contradictory later deliveries. Order
+  state lives in the serving instance's memory, so reconciliation is demonstrated rather than
+  guaranteed — see **Order state is in memory** below.
 - **Displayed-total integrity.** The server signs the exact quote shown in the payment element.
   The charge must use that same unexpired quote; changed or tampered checkout data is rejected.
 - **Safe public-demo behavior.** The hosted runtime starts at a cap of zero and accepts only exact
-  integer caps from `0` through `50`. Positive caps count new orders per UTC day under a global
-  PostgreSQL advisory lock, while a database constraint permits only one unresolved checkout at a
-  time. That claim expires: a checkout nothing has advanced for 15 minutes is reclaimed as
-  `abandoned` by the next admission, so a dropped webhook costs one order rather than the store,
-  and no hand-editing of the database is needed to recover. `abandoned` asserts no payment
-  outcome, so a terminal delivery arriving later still reconciles the order it belongs to.
-  `/health` reports `activeCheckoutAgeSeconds` and `abandonCheckoutAfterSeconds` so a held claim
-  is visible without a database session. Same-checkout retries keep their stable order and
+  integer caps from `0` through `50`. Positive caps count new orders per UTC day, and only one
+  unresolved checkout is admitted at a time. That claim expires: a checkout nothing has advanced
+  for 15 minutes is reclaimed as `abandoned` by the next admission, so a dropped webhook costs one
+  order rather than the store. `abandoned` asserts no payment outcome, so a terminal delivery
+  arriving later still reconciles the order it belongs to. `/health` reports
+  `activeCheckoutAgeSeconds` and `abandonCheckoutAfterSeconds` so a held claim is visible at a
+  glance. Same-checkout retries keep their stable order and
   idempotency key. The runtime refuses Live keys and any API host outside an explicit allowlist of
   Test-rail origins; server-attested `custom_api` provenance is required before quote or payment
   I/O on the Sandbox rail, which is the only host that issues it. It also validates the five
@@ -63,6 +63,35 @@ Browser (public pk_)                         Backend (secret sk_)
 
 This is a reference demo, not a production commerce application. It deliberately omits accounts,
 fulfilment, inventory, and live payments.
+
+## Order state is in memory
+
+There is no database. Orders, the UTC-day count, the single-active-checkout claim, and webhook
+delivery evidence all live in the serving process's memory, and every deployment path — local
+tutorial and hosted — uses the same store.
+
+This is deliberate. The demo's job is to show a cross-border checkout: a signed quote, a Test
+payment, and the safety rails around them. Nothing in the storefront ever reads reconciled order
+state back — the browser calls only `/quote` and `/charge` — so durable state was carrying two
+abuse limits and a webhook projection with no reader, at the cost of a database, four migrations,
+and a migration step in every deploy.
+
+What that means on a serverless host, which runs more than one instance and recycles them:
+
+- **The daily cap and the active-checkout claim are per instance**, so they are a brake rather than
+  a hard ceiling. The in-process rate limiter already had exactly this property, which is why a
+  platform-level rate-limit rule on `/quote` and `/charge` is the real control for a sustained
+  public deployment (see below).
+- **A webhook can arrive at an instance that never saw the order**, and is then acknowledged
+  without reconciling. Signature, timestamp, Test-mode and provenance checks still run in full, so
+  what the demo teaches about webhook verification is unaffected; what it cannot promise is that
+  every delivery finds its order.
+- **Nothing survives a restart or a cold start**, which also means a stuck claim cannot outlive the
+  instance holding it.
+
+If a future version of this demo needs to show durable reconciliation as a guarantee rather than a
+demonstration, that needs shared state again — and it should be added back deliberately, for that
+reason, rather than because the demo once had it.
 
 ## Run the local tutorial
 
@@ -77,12 +106,12 @@ npm start               # http://127.0.0.1:4000
 ```
 
 `npm start` is a deliberately local-only tutorial path. It binds to `127.0.0.1`, accepts Test keys
-only, uses the exact Sandbox API, and permits one in-memory Test checkout per server restart. It
-does not require PostgreSQL, a webhook signing secret, or an order-reference HMAC secret.
+only, uses the exact Sandbox API, and permits one Test checkout per server restart. It does not
+require a webhook signing secret or an order-reference HMAC secret.
 
-The simplified path is not durable and cannot reconcile an asynchronous payment outcome: its
-`/health` response reports `mode: "local-tutorial"`, `durableOrders: false`, and
-`authenticWebhooks: false`. It also reports `trustedDemoProvenanceRequired: false`, because an
+The simplified path cannot reconcile an asynchronous payment outcome, because it mounts no webhook
+receiver: its `/health` response reports `mode: "local-tutorial"` and `authenticWebhooks: false`.
+It also reports `trustedDemoProvenanceRequired: false`, because an
 ordinary viewer-owned Test key pair is not expected to carry the hosted public store's internal
 `demo_store=custom_api` attestation. After submitting the one Test payment, restart the local server
 before rehearsing again. Restarting clears only the local in-memory guard; it does not delete or
@@ -97,7 +126,7 @@ total remain locked for that checkout. The ships-from origin is the US, so a US 
 and shows no duties/taxes; pick e.g. United Kingdom or Canada to see them. Complete at most one
 synthetic Test checkout; no real money moves. The receipt shows the commercial breakdown and
 retry-safe checkout reference without exposing provider or routing identifiers. It proves only
-submission from the local tutorial, not durable order reconciliation.
+submission from the local tutorial, not terminal order reconciliation.
 
 The local server will not start with `sk_live_…` or `pk_live_…` credentials. Keep both Test keys
 out of the recording, terminal history, source files, and browser-visible configuration. This
@@ -115,14 +144,13 @@ npm test
 npm run check:secrets
 ```
 
-The tests cover catalog tampering, signed displayed quotes, same-key retries, atomic UTC-day cap
-admission through the 50th/51st boundary, single-active-checkout enforcement, UTC reset, cap-zero
-readiness, secret-safe cap usage health, current trade-lane quoting, trusted Custom API provenance,
-bounded early-webhook staging, monotonic terminal reconciliation, changed-request rejection,
-provider-safe errors, malformed JSON, the local throttle, and Live-key refusal. CI provisions a
-dedicated disposable PostgreSQL database for real multi-connection admission, attachment/webhook
-interleaving, restart durability, deduplication, and UTC-cap tests. It also runs the repository
-secret scanner on every tracked and untracked source file.
+The tests cover catalog tampering, signed displayed quotes, same-key retries, UTC-day cap
+admission through the 50th/51st boundary, single-active-checkout enforcement and its 15-minute
+reclaim, UTC reset, cap-zero readiness, secret-safe cap usage health, current trade-lane quoting,
+trusted Custom API provenance, bounded early-webhook staging, monotonic terminal reconciliation,
+changed-request rejection, provider-safe errors, malformed JSON, the local throttle, and Live-key
+refusal. They need no services: `npm test` is the whole suite. CI also runs the repository secret
+scanner on every tracked and untracked source file.
 
 For a sustained public deployment, add a platform-level rate-limit rule for `/quote` and
 `/charge`. An in-process limiter resets with serverless instances and is only a local safety net.
@@ -143,42 +171,37 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 `/charge` to.
 
 1. Import the repo in Vercel (framework preset **Other**, no build command).
-2. Apply `migrations/001_durable_orders.sql`, `migrations/002_daily_transaction_cap.sql`,
-   `migrations/003_webhook_reconciliation.sql`, then
-   `migrations/004_reclaim_abandoned_checkouts.sql`, in that order to an owned durable Postgres
-   database. `/health` reports `durableOrders: false` until 004 is applied, because the
-   admission path's reclaim writes a status the earlier CHECK constraint rejects.
-3. Configure the Test credential pair, exact Sandbox API host, webhook signing secret, database
-   connection, and private-reference HMAC secret in the hosting platform.
-4. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning, database readiness, deployment,
-   and provider delivery have each received their own explicit approval.
-5. Deploy and verify `/health` reports cap `0`, usage `0`, no active checkout, durable storage,
-   authentic webhooks, and trusted Custom API provenance.
-6. After a separately approved activation, set `DEMO_TRANSACTION_CAP=50`; never reset the daily
-   count or bypass an unresolved checkout to finish a demo.
+2. Configure the Test credential pair, an allowlisted API host, the webhook signing secret, and the
+   private-reference HMAC secret in the hosting platform. There is no database to provision.
+3. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning, deployment, and provider delivery
+   have each received their own explicit approval.
+4. Deploy and verify `/health` reports cap `0`, usage `0`, no active checkout, authentic webhooks,
+   and trusted Custom API provenance.
+5. Add the platform-level rate-limit rule for `/quote` and `/charge`. With order state in memory
+   this is the only store-wide control on a public deployment, not merely a hardening step.
+6. After a separately approved activation, set `DEMO_TRANSACTION_CAP=50`; never bypass an
+   unresolved checkout to finish a demo.
 
 For an upgrade of the maintained `sample-store-ten.vercel.app` production demo, the approved cap
 is already `50`. Preserve that value throughout the upgrade; do not use the fresh-install cap-zero
-transition above. Before migration or deployment, separately approve and enable a reversible edge
-maintenance rule that blocks only `POST /quote` and `POST /charge`, while leaving static/health GETs
-and `POST /webhooks/openborder` reachable. Verify both transaction routes fail closed without
-provider I/O, then record the UTC-day usage, active-checkout state, and pending-webhook count.
+transition above. Before deployment, separately approve and enable a reversible edge maintenance
+rule that blocks only `POST /quote` and `POST /charge`, while leaving static/health GETs and
+`POST /webhooks/openborder` reachable. Verify both transaction routes fail closed without provider
+I/O, then record the UTC-day usage and active-checkout state.
 
-Apply only `migrations/004_reclaim_abandoned_checkouts.sql`; it is transaction-wrapped and must
-run with stop-on-error. Deploy the exact approved commit while the edge block remains enabled.
-Recheck the same aggregates and every readiness boolean before lifting the block under a separate
-approval.
-If any usage, active-checkout, or pending evidence drifts, keep new admissions blocked and
-reconcile on the new code. Roll application code back only when no checkout or pending evidence is
-active, and leave the additive migration installed. Changing the cap, creating a quote, starting a
-checkout, or replaying a webhook requires its own explicit approval.
+Deploy the exact approved commit while the edge block remains enabled, and recheck the same
+aggregates and every readiness boolean before lifting the block under a separate approval. A
+deployment replaces every instance, so in-memory usage counts and any held claim reset with it —
+record the pre-deploy figures for evidence rather than expecting them to carry over. Roll
+application code back only when no checkout is active. Changing the cap, creating a quote, starting
+a checkout, or replaying a webhook requires its own explicit approval.
 
 The hosted runtime accepts Test keys only and requires `OB_API_URL` to be one of the allowlisted
 Test-rail origins — `https://api-sandbox.openborderpayments.com`, which attests demo provenance,
 or `https://api-staging.openborderpayments.com`, which does not. With `DEMO_TRANSACTION_CAP=0`,
-transaction routes remain closed while `/health` can independently prove durable-order,
-authentic-webhook, and trusted Custom API provenance readiness. Missing prerequisites remain
-visible only as false readiness booleans.
+transaction routes remain closed while `/health` can independently prove authentic-webhook and
+trusted Custom API provenance readiness. Missing prerequisites remain visible only as false
+readiness booleans.
 
 ### Enable Apple Pay / Google Pay
 

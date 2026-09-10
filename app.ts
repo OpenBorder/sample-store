@@ -1,7 +1,6 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
-import postgres from 'postgres';
 import {
   OpenBorderApiError,
   OpenBorderClient,
@@ -13,7 +12,6 @@ import {
 import {
   ABANDONED_CHECKOUT_AFTER_SECONDS,
   createMemoryOrderStore,
-  createPostgresOrderStore,
   type OrderStore,
 } from './order-store';
 import { createWebhookReceiver, hashPrivateReference } from './webhook';
@@ -389,9 +387,7 @@ export function createApp(
   const trustedDemoProvenanceRequired = config.requireTrustedDemoProvenance ?? true;
   const store = options.store ?? createMemoryOrderStore();
   const referenceSecret = options.referenceSecret ?? signingSecret;
-  const durableOrders = options.store !== undefined;
-  const authenticWebhooks =
-    durableOrders && Boolean(options.webhookSecret && options.referenceSecret);
+  const authenticWebhooks = Boolean(options.webhookSecret && options.referenceSecret);
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
@@ -421,34 +417,25 @@ export function createApp(
   const chargeLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false });
 
   app.get('/health', async (_req, res) => {
-    const [storeReady, usage, trustedDemoProvenance] = await Promise.all([
-      durableOrders ? store.checkReady().catch(() => false) : false,
-      durableOrders
-        ? store
-            .getUsage()
-            .catch(() => null)
-        : {
-            activeCheckout: false,
-            activeCheckoutAgeSeconds: null,
-            transactionsUsedToday: 0,
-          },
+    const [usage, trustedDemoProvenance] = await Promise.all([
+      store.getUsage(),
       hasTrustedCustomApiProvenance(client, 'USD'),
     ]);
-    const durableStoreReady = storeReady && usage !== null;
     res.json({
       ok: true,
       mode: config.mode ?? 'production-sandbox',
       transactionsEnabled,
       transactionCap,
-      transactionsUsedToday: usage?.transactionsUsedToday ?? 0,
-      activeCheckout: usage?.activeCheckout ?? false,
+      // Counted in this instance's memory. Serverless deployments run more than one and
+      // recycle them, so these are what THIS instance has seen, not a store-wide total —
+      // the same limitation the in-memory rate limiter above already has.
+      transactionsUsedToday: usage.transactionsUsedToday,
+      activeCheckout: usage.activeCheckout,
       // An age past the window says the next checkout attempt will reclaim the claim
-      // itself — which is the difference between reading this and opening a database
-      // session to find out why the store is refusing every checkout.
-      activeCheckoutAgeSeconds: usage?.activeCheckoutAgeSeconds ?? null,
+      // itself, rather than the claim being stuck until the instance recycles.
+      activeCheckoutAgeSeconds: usage.activeCheckoutAgeSeconds,
       abandonCheckoutAfterSeconds: ABANDONED_CHECKOUT_AFTER_SECONDS,
-      durableOrders: durableStoreReady,
-      authenticWebhooks: authenticWebhooks && durableStoreReady,
+      authenticWebhooks,
       trustedDemoProvenance,
       ...(trustedDemoProvenanceRequired ? {} : { trustedDemoProvenanceRequired: false }),
     });
@@ -473,10 +460,6 @@ export function createApp(
       return;
     }
     try {
-      if (!(await store.checkReady().catch(() => false))) {
-        res.status(503).json({ ok: false, code: 'demo_not_ready' });
-        return;
-      }
       const input = parseCheckoutInput(req.body, false);
       const product = CATALOG[input.productId];
       if (
@@ -539,10 +522,6 @@ export function createApp(
       return;
     }
     try {
-      if (!(await store.checkReady().catch(() => false))) {
-        res.status(503).json({ ok: false, code: 'demo_not_ready' });
-        return;
-      }
       const input = parseChargeInput(req.body);
       const quote = verifyQuote(input.quoteToken, signingSecret, input);
       if (
@@ -727,11 +706,10 @@ export function createConfiguredApp(
   }
 
   const transactionCap = readTransactionCap(env.DEMO_TRANSACTION_CAP);
-  const databaseUrl = env.DATABASE_URL;
   const webhookSecret = env.OB_WEBHOOK_SECRET;
   const referenceSecret = env.ORDER_REFERENCE_HMAC_SECRET;
   const readinessPrerequisitesPresent = Boolean(
-    secretKey && publishableKey && databaseUrl && webhookSecret && referenceSecret,
+    secretKey && publishableKey && webhookSecret && referenceSecret,
   );
 
   if (transactionCap === 0 && !readinessPrerequisitesPresent) {
@@ -755,10 +733,8 @@ export function createConfiguredApp(
 
   assertTestCredentials(secretKey, publishableKey);
   const apiTarget = resolveApiTarget(apiBaseUrl);
-  if (!databaseUrl || !webhookSecret || !referenceSecret) {
-    throw new Error(
-      'Configured demo readiness requires durable storage and webhook prerequisites.',
-    );
+  if (!webhookSecret || !referenceSecret) {
+    throw new Error('Configured demo readiness requires the webhook prerequisites.');
   }
   if (!webhookSecret.startsWith('whsec_')) {
     throw new Error('Configured demo readiness requires an authentic webhook signing secret.');
@@ -768,7 +744,6 @@ export function createConfiguredApp(
   }
 
   const client = options.gateway ?? createOpenBorderClient(secretKey!, apiBaseUrl);
-  const sql = postgres(databaseUrl, { max: 1, prepare: false });
   return createApp(
     {
       publishableKey: publishableKey!,
@@ -781,11 +756,7 @@ export function createConfiguredApp(
     },
     client,
     referenceSecret,
-    {
-      store: createPostgresOrderStore(sql),
-      webhookSecret,
-      referenceSecret,
-    },
+    { webhookSecret, referenceSecret },
   );
 }
 

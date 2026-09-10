@@ -106,7 +106,6 @@ test('hosted runtime is healthy but transaction routes fail closed by default', 
     activeCheckout: false,
     activeCheckoutAgeSeconds: null,
     abandonCheckoutAfterSeconds: 900,
-    durableOrders: false,
     authenticWebhooks: false,
     trustedDemoProvenance: true,
   });
@@ -115,7 +114,7 @@ test('hosted runtime is healthy but transaction routes fail closed by default', 
   assert.equal(gateway.paymentCalls, 0);
 });
 
-test('cap zero proves durable order, webhook, and trusted provenance readiness without opening routes', async () => {
+test('cap zero proves webhook and trusted provenance readiness without opening routes', async () => {
   const gateway = new Gateway();
   const app = createApp(
     { publishableKey: 'pk_test_public_example', transactionCap: 0 },
@@ -141,7 +140,6 @@ test('cap zero proves durable order, webhook, and trusted provenance readiness w
     activeCheckout: false,
     activeCheckoutAgeSeconds: null,
     abandonCheckoutAfterSeconds: 900,
-    durableOrders: true,
     authenticWebhooks: true,
     trustedDemoProvenance: true,
   });
@@ -671,8 +669,8 @@ test('production starts at zero cap without credentials and enabling requires ev
   const health = await request(disabled).get('/health').expect(200);
   assert.equal(health.body.transactionsEnabled, false);
 
-  // Keys and a supported host are not enough: durable storage and the webhook
-  // prerequisites are still required before a capped demo will open.
+  // Keys and a supported host are not enough: the webhook prerequisites are still
+  // required before a capped demo will open.
   assert.throws(
     () =>
       createConfiguredApp({
@@ -682,7 +680,7 @@ test('production starts at zero cap without credentials and enabling requires ev
         OB_SECRET_KEY: 'sk_test_example',
         OB_PUBLISHABLE_KEY: 'pk_test_example',
       }),
-    /requires durable storage and webhook prerequisites/,
+    /requires the webhook prerequisites/,
   );
 
   // And an unsupported host is refused before any prerequisite is considered.
@@ -706,7 +704,6 @@ test('configured cap zero constructs readiness dependencies while keeping transa
     OB_SECRET_KEY: 'sk_test_example',
     OB_PUBLISHABLE_KEY: 'pk_test_example',
     OB_API_URL: 'https://api-sandbox.openborderpayments.com',
-    DATABASE_URL: 'postgres://example.invalid/sample_store',
     OB_WEBHOOK_SECRET: 'whsec_example',
     ORDER_REFERENCE_HMAC_SECRET: 'r'.repeat(32),
   });

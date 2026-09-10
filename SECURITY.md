@@ -3,33 +3,38 @@
 This repository is a public test-mode reference application.
 
 - Never commit `.env` files or Open Border credentials.
+- Order state, the UTC-day count, the active-checkout claim and webhook delivery evidence are held
+  in the serving process's memory; there is no database. On a serverless host these are per
+  instance, so the cap and the one-checkout limit are a brake rather than a store-wide ceiling, and
+  a platform-level rate-limit rule is the control that does not depend on instance identity.
 - The hosted server starts at a transaction cap of zero and accepts only exact integer caps from
-  zero through 50. Positive caps count orders per UTC day under a global PostgreSQL lock, and the
-  database permits only one unresolved checkout at a time. The server refuses Live keys and accepts
-  only an API host on its explicit allowlist: the production-dashboard Sandbox host and the staging
-  host. Each must match exactly, with no path, query, fragment or credentials, and Test credentials
-  are refused independently of the host, so every reachable target is a Test-rail host.
+  zero through 50. Positive caps count orders per UTC day, and only one unresolved checkout is
+  admitted at a time; a claim nothing has advanced for 15 minutes is reclaimed by the next
+  admission, so a dropped delivery costs one order rather than the store. The server refuses Live
+  keys and accepts only an API host on its explicit allowlist: the production-dashboard Sandbox
+  host and the staging host. Each must match exactly, with no path, query, fragment or credentials,
+  and Test credentials are refused independently of the host, so every reachable target is a
+  Test-rail host.
 - The secret key stays server-side; only the publishable key is returned to the browser.
 - Public product prices and tariff codes are resolved against the server catalog.
 - Displayed quotes are signed and bound to one checkout before payment creation.
-- Orders and HMAC-bound stable idempotency keys are durably persisted before payment creation.
-  The key fingerprints the exact provider submission, so a changed retry is rejected before
+- Orders and HMAC-bound stable idempotency keys are recorded before payment creation. The key is
+  derived from the submission rather than stored, so it is stable across instances and restarts
+  even though the order record is not. It fingerprints the exact provider submission, so a changed retry is rejected before
   payment-intent I/O and an ambiguous provider response remains nonterminal for authentic reconciliation.
 - Provider and webhook delivery references are stored only as keyed hashes.
 - Terminal order state changes require a timestamped, authentic raw-body webhook whose signed
   event declares Test mode, and trusted `custom_api` provenance wherever the target attests it
-  (see the accepted risk below). Duplicate deliveries are durably
+  (see the accepted risk below). Duplicate deliveries are
   ignored, while signed non-Test or foreign-demo events are acknowledged without reconciliation
   or delivery retention. An early owned terminal delivery may be staged only while one checkout
-  is active; that hash-only staging area is capped at eight rows, expires after 15 minutes, and is
-  reconciled under the same PostgreSQL advisory lock used by payment-reference attachment.
-- Accepted delivery evidence uses database receipt time for retention; signed provider occurrence
+  is active; that hash-only staging area is capped at eight entries and expires after 15 minutes.
+- Accepted delivery evidence uses local receipt time for retention; signed provider occurrence
   time is retained separately only while an early delivery is pending.
-- Public deployments should also enforce a platform-level rate limit because serverless instances
-  do not share in-memory counters.
+- Public deployments must enforce a platform-level rate limit: serverless instances share no
+  state, so every in-process limit above is per instance.
 - Cap-preserving upgrades require an edge maintenance rule that blocks only transaction POSTs
-  while keeping authentic webhooks reachable until migration, deployment, and aggregate checks
-  finish.
+  while keeping authentic webhooks reachable until deployment and aggregate checks finish.
 
 ## Accepted risk: the public store runs against staging
 

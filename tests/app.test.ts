@@ -263,26 +263,6 @@ test('quote fails closed before tax provider I/O without trusted Custom API prov
   assert.equal(gateway.quoteCalls, 0);
 });
 
-test('quote and charge fail closed before provider I/O when durable storage is not ready', async () => {
-  const gateway = new FakeGateway();
-  const store = {
-    ...createMemoryOrderStore(),
-    checkReady: async () => false,
-  };
-  const app = createApp(
-    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
-    gateway,
-    'unit-test-signing-secret',
-    { store },
-  );
-
-  assert.equal((await request(app).post('/quote').send(baseInput).expect(503)).body.code, 'demo_not_ready');
-  assert.equal((await request(app).post('/charge').send(baseInput).expect(503)).body.code, 'demo_not_ready');
-  assert.equal(gateway.configCalls, 0);
-  assert.equal(gateway.quoteCalls, 0);
-  assert.equal(gateway.paymentCalls.length, 0);
-});
-
 test('domestic checkout still uses a server-issued tax quote', async () => {
   const { app, gateway } = createTestApp();
   const domesticInput = {
@@ -847,7 +827,7 @@ test('malformed JSON returns the normal safe validation envelope', async () => {
   assert.equal(response.body.fields.body, 'Send valid JSON.');
 });
 
-test('local tutorial needs only Test keys and permits one non-durable checkout per restart', async () => {
+test('local tutorial needs only Test keys and permits one checkout per restart', async () => {
   const gateway = new FakeGateway();
   gateway.demoStore = undefined;
   const app = createConfiguredApp(
@@ -868,7 +848,6 @@ test('local tutorial needs only Test keys and permits one non-durable checkout p
     activeCheckout: false,
     activeCheckoutAgeSeconds: null,
     abandonCheckoutAfterSeconds: 900,
-    durableOrders: false,
     authenticWebhooks: false,
     trustedDemoProvenance: false,
     trustedDemoProvenanceRequired: false,
@@ -933,7 +912,6 @@ test('transaction cap defaults closed and accepts exact integers through fifty',
     OB_SECRET_KEY: 'sk_test_example',
     OB_PUBLISHABLE_KEY: 'pk_test_example',
     OB_API_URL: 'https://api-sandbox.openborderpayments.com',
-    DATABASE_URL: 'postgres://example.invalid/sample_store',
     OB_WEBHOOK_SECRET: 'whsec_example',
     ORDER_REFERENCE_HMAC_SECRET: 'r'.repeat(32),
   });
@@ -1019,7 +997,6 @@ const stagingEnv = {
   DEMO_TRANSACTION_CAP: '50',
   OB_SECRET_KEY: 'sk_test_example',
   OB_PUBLISHABLE_KEY: 'pk_test_example',
-  DATABASE_URL: 'postgres://example.invalid/sample_store',
   OB_WEBHOOK_SECRET: 'whsec_example',
   ORDER_REFERENCE_HMAC_SECRET: 'r'.repeat(32),
 };
