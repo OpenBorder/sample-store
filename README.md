@@ -50,10 +50,16 @@ Browser (public pk_)                         Backend (secret sk_)
 - **Safe public-demo behavior.** The hosted runtime starts at a cap of zero and accepts only exact
   integer caps from `0` through `50`. Positive caps count new orders per UTC day under a global
   PostgreSQL advisory lock, while a database constraint permits only one unresolved checkout at a
-  time. Same-checkout retries keep their stable order and idempotency key. The runtime refuses Live
-  keys or any API host except the production-dashboard Sandbox rail and requires server-attested
-  `custom_api` provenance before quote or payment I/O. It also validates the five catalog products,
-  throttles per instance, and sanitizes upstream errors.
+  time. That claim expires: a checkout nothing has advanced for 15 minutes is reclaimed as
+  `abandoned` by the next admission, so a dropped webhook costs one order rather than the store,
+  and no hand-editing of the database is needed to recover. `abandoned` asserts no payment
+  outcome, so a terminal delivery arriving later still reconciles the order it belongs to.
+  `/health` reports `activeCheckoutAgeSeconds` and `abandonCheckoutAfterSeconds` so a held claim
+  is visible without a database session. Same-checkout retries keep their stable order and
+  idempotency key. The runtime refuses Live keys and any API host outside an explicit allowlist of
+  Test-rail origins; server-attested `custom_api` provenance is required before quote or payment
+  I/O on the Sandbox rail, which is the only host that issues it. It also validates the five
+  catalog products, throttles per instance, and sanitizes upstream errors.
 
 This is a reference demo, not a production commerce application. It deliberately omits accounts,
 fulfilment, inventory, and live payments.
@@ -137,9 +143,11 @@ serverless function (`api/index.ts`) that `vercel.json` rewrites `/config.js`, `
 `/charge` to.
 
 1. Import the repo in Vercel (framework preset **Other**, no build command).
-2. Apply `migrations/001_durable_orders.sql`, `migrations/002_daily_transaction_cap.sql`, then
-   `migrations/003_webhook_reconciliation.sql`, in that order to an owned durable Postgres
-   database.
+2. Apply `migrations/001_durable_orders.sql`, `migrations/002_daily_transaction_cap.sql`,
+   `migrations/003_webhook_reconciliation.sql`, then
+   `migrations/004_reclaim_abandoned_checkouts.sql`, in that order to an owned durable Postgres
+   database. `/health` reports `durableOrders: false` until 004 is applied, because the
+   admission path's reclaim writes a status the earlier CHECK constraint rejects.
 3. Configure the Test credential pair, exact Sandbox API host, webhook signing secret, database
    connection, and private-reference HMAC secret in the hosting platform.
 4. Leave `DEMO_TRANSACTION_CAP=0` until credential provisioning, database readiness, deployment,
@@ -156,19 +164,21 @@ maintenance rule that blocks only `POST /quote` and `POST /charge`, while leavin
 and `POST /webhooks/openborder` reachable. Verify both transaction routes fail closed without
 provider I/O, then record the UTC-day usage, active-checkout state, and pending-webhook count.
 
-Apply only `migrations/003_webhook_reconciliation.sql`; it is transaction-wrapped and must run with
-stop-on-error. Deploy the exact approved commit while the edge block remains enabled. Recheck the
-same aggregates and every readiness boolean before lifting the block under a separate approval.
+Apply only `migrations/004_reclaim_abandoned_checkouts.sql`; it is transaction-wrapped and must
+run with stop-on-error. Deploy the exact approved commit while the edge block remains enabled.
+Recheck the same aggregates and every readiness boolean before lifting the block under a separate
+approval.
 If any usage, active-checkout, or pending evidence drifts, keep new admissions blocked and
 reconcile on the new code. Roll application code back only when no checkout or pending evidence is
 active, and leave the additive migration installed. Changing the cap, creating a quote, starting a
 checkout, or replaying a webhook requires its own explicit approval.
 
-The hosted runtime accepts Test keys only and pins `OB_API_URL` to
-`https://api-sandbox.openborderpayments.com`. With `DEMO_TRANSACTION_CAP=0`, transaction routes
-remain closed while `/health` can independently prove durable-order, authentic-webhook, and
-trusted Custom API provenance readiness. Missing prerequisites remain visible only as false
-readiness booleans.
+The hosted runtime accepts Test keys only and requires `OB_API_URL` to be one of the allowlisted
+Test-rail origins — `https://api-sandbox.openborderpayments.com`, which attests demo provenance,
+or `https://api-staging.openborderpayments.com`, which does not. With `DEMO_TRANSACTION_CAP=0`,
+transaction routes remain closed while `/health` can independently prove durable-order,
+authentic-webhook, and trusted Custom API provenance readiness. Missing prerequisites remain
+visible only as false readiness booleans.
 
 ### Enable Apple Pay / Google Pay
 

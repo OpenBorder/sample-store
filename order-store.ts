@@ -3,6 +3,7 @@ import type { Sql, TransactionSql } from 'postgres';
 export type OrderStatus =
   | 'awaiting_payment'
   | 'payment_submitted'
+  | 'abandoned'
   | 'paid'
   | 'payment_failed';
 
@@ -17,6 +18,14 @@ export interface StoredOrder {
 
 export interface OrderStoreUsage {
   readonly activeCheckout: boolean;
+  /**
+   * How long the active checkout has held the claim, or null when none does. Reported
+   * on /health so an unreconciled checkout is one look rather than a Postgres session:
+   * an age past {@link ABANDONED_CHECKOUT_AFTER_SECONDS} says the next admission will
+   * reclaim it. The checkout's ID is deliberately NOT reported — /health is public, and
+   * the reason to want the ID was to repair the row by hand, which no longer arises.
+   */
+  readonly activeCheckoutAgeSeconds: number | null;
   readonly transactionsUsedToday: number;
 }
 
@@ -27,6 +36,19 @@ const PAYMENT_REFERENCE_LOCK_SEED = 645;
 const MAX_PENDING_WEBHOOKS = 8;
 const PENDING_WEBHOOK_RETENTION_SECONDS = 15 * 60;
 const PENDING_WEBHOOK_RETENTION_MS = PENDING_WEBHOOK_RETENTION_SECONDS * 1000;
+/**
+ * How long an unreconciled checkout may hold the single-active-checkout claim before
+ * the next admission reclaims it as `abandoned`. Matches the pending-webhook retention
+ * above: past that point this store has already stopped waiting for a delivery it
+ * cannot match, so it is the same judgement about the same latency.
+ *
+ * Measured from `updated_at`, not `created_at`, so the window runs from the last thing
+ * that actually happened to the order. A payment submitted late in a slow checkout then
+ * gets the full window from its submission, which is the transition a real terminal
+ * webhook follows.
+ */
+export const ABANDONED_CHECKOUT_AFTER_SECONDS = 15 * 60;
+const ABANDONED_CHECKOUT_AFTER_MS = ABANDONED_CHECKOUT_AFTER_SECONDS * 1000;
 
 export interface OrderStore {
   checkReady(): Promise<boolean>;
@@ -62,6 +84,7 @@ export function createMemoryOrderStore(
 ): OrderStore & { deliveryCount(): number } {
   const orders = new Map<string, StoredOrder>();
   const createdAt = new Map<string, Date>();
+  const updatedAt = new Map<string, Date>();
   const paymentReferences = new Map<string, string>();
   const deliveries = new Map<string, Date>();
   const pendingDeliveries = new Map<
@@ -75,35 +98,59 @@ export function createMemoryOrderStore(
   >();
   const now = options.now ?? (() => new Date());
 
+  const save = (checkoutId: string, order: StoredOrder) => {
+    orders.set(checkoutId, order);
+    updatedAt.set(checkoutId, now());
+  };
+  /** The one entry holding the single-active-checkout claim, if any. */
+  const claimHolder = () =>
+    [...orders.entries()].find(([, stored]) => holdsClaim(stored.status));
+  /**
+   * Release a claim nothing has advanced inside the window. Runs on the admission path
+   * only: a claim is genuinely held until it is reclaimed, so a read must not report
+   * otherwise, and /health must not mutate.
+   */
+  const reclaimStaleClaim = () => {
+    const cutoff = new Date(now().getTime() - ABANDONED_CHECKOUT_AFTER_MS);
+    for (const [checkoutId, stored] of orders) {
+      const touched = updatedAt.get(checkoutId);
+      if (holdsClaim(stored.status) && touched && touched < cutoff) {
+        save(checkoutId, { ...stored, status: 'abandoned' });
+      }
+    }
+  };
+
   return {
     checkReady: async () => true,
     getUsage: async () => {
       const startOfToday = startOfUtcDay(now());
       const startOfTomorrow = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000);
+      const holder = claimHolder();
+      const heldSince = holder ? updatedAt.get(holder[0]) : undefined;
       return {
-        activeCheckout: [...orders.values()].some(
-          (stored) =>
-            stored.status === 'awaiting_payment' || stored.status === 'payment_submitted',
-        ),
+        activeCheckout: holder !== undefined,
+        activeCheckoutAgeSeconds: heldSince
+          ? Math.floor((now().getTime() - heldSince.getTime()) / 1000)
+          : null,
         transactionsUsedToday: [...createdAt.values()].filter(
           (created) => created >= startOfToday && created < startOfTomorrow,
         ).length,
       };
     },
     createOrGetWithinCap: async (order, transactionCap) => {
+      // Before the lookup below, so a retry of the STUCK checkout reclaims it too. The
+      // shopper holding a claim nothing reconciled is the likeliest person to try again,
+      // and reclaiming first is what turns their retry into the repair: they are told to
+      // start a new checkout instead of submitting against an order that can no longer
+      // reconcile. Reclaiming after the lookup would heal the store only for whoever
+      // came next.
+      reclaimStaleClaim();
       const existing = orders.get(order.checkoutId);
       if (existing) {
         assertSameOrder(existing, order);
         return existing;
       }
-      if (
-        [...orders.values()].some(
-          (stored) =>
-            stored.status === 'awaiting_payment' || stored.status === 'payment_submitted',
-        )
-      ) {
-        return 'active_checkout';
-      }
+      if (claimHolder()) return 'active_checkout';
       const admissionTime = now();
       const startOfToday = startOfUtcDay(admissionTime);
       const startOfTomorrow = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000);
@@ -111,7 +158,7 @@ export function createMemoryOrderStore(
         (created) => created >= startOfToday && created < startOfTomorrow,
       ).length;
       if (usedToday >= transactionCap) return 'cap_reached';
-      orders.set(order.checkoutId, { ...order });
+      save(order.checkoutId, { ...order });
       createdAt.set(order.checkoutId, admissionTime);
       options.onWrite?.();
       return order;
@@ -121,7 +168,12 @@ export function createMemoryOrderStore(
       const order = requireOrder(orders, checkoutId);
       paymentReferences.set(paymentReferenceHash, checkoutId);
       if (isTerminal(order.status)) return 'terminal_noop';
-      orders.set(checkoutId, { ...order, status: 'payment_submitted' });
+      // A reclaimed checkout does NOT re-take the claim: another checkout may hold it by
+      // now, and two holders is the one thing the unique index refuses. The reference is
+      // still attached above, which is what lets a late terminal webhook find the order.
+      if (holdsClaim(order.status)) {
+        save(checkoutId, { ...order, status: 'payment_submitted' });
+      }
       const pendingCutoff = new Date(now().getTime() - PENDING_WEBHOOK_RETENTION_MS);
       for (const [deliveryHash, delivery] of pendingDeliveries) {
         if (delivery.receivedAt < pendingCutoff) pendingDeliveries.delete(deliveryHash);
@@ -137,7 +189,7 @@ export function createMemoryOrderStore(
         deliveries.set(deliveryHash, now());
         const current = requireOrder(orders, checkoutId);
         if (!isTerminal(current.status)) {
-          orders.set(checkoutId, { ...current, status: delivery.status });
+          save(checkoutId, { ...current, status: delivery.status });
         }
       }
       return 'attached';
@@ -145,7 +197,7 @@ export function createMemoryOrderStore(
     markPaymentFailed: async (checkoutId) => {
       const order = requireOrder(orders, checkoutId);
       if (isTerminal(order.status)) return 'terminal_noop';
-      orders.set(checkoutId, { ...order, status: 'payment_failed' });
+      save(checkoutId, { ...order, status: 'payment_failed' });
       return 'applied';
     },
     applyWebhook: async (input) => {
@@ -158,11 +210,7 @@ export function createMemoryOrderStore(
         for (const [deliveryHash, delivery] of pendingDeliveries) {
           if (delivery.receivedAt < pendingCutoff) pendingDeliveries.delete(deliveryHash);
         }
-        const hasActiveCheckout = [...orders.values()].some(
-          (stored) =>
-            stored.status === 'awaiting_payment' || stored.status === 'payment_submitted',
-        );
-        if (!hasActiveCheckout) return 'unowned';
+        if (!claimHolder()) return 'unowned';
         if (pendingDeliveries.size >= MAX_PENDING_WEBHOOKS) return 'capacity_reached';
         pendingDeliveries.set(input.deliveryHash, {
           paymentReferenceHash: input.paymentReferenceHash,
@@ -175,7 +223,7 @@ export function createMemoryOrderStore(
       const order = requireOrder(orders, checkoutId);
       deliveries.set(input.deliveryHash, now());
       if (isTerminal(order.status)) return 'terminal_noop';
-      orders.set(checkoutId, { ...order, status: input.status });
+      save(checkoutId, { ...order, status: input.status });
       return 'applied';
     },
     purgeDeliveriesBefore: async (cutoff) => {
@@ -210,6 +258,7 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
         pendingDeliveries: string | null;
         pendingReference: string | null;
         pendingRetention: string | null;
+        reclaimStatus: boolean;
       }[]>`
         SELECT
           to_regclass('sample_store_orders')::text AS orders,
@@ -224,7 +273,14 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
           to_regclass('sample_store_pending_webhooks_reference_idx')::text
             AS "pendingReference",
           to_regclass('sample_store_pending_webhooks_retention_idx')::text
-            AS "pendingRetention"
+            AS "pendingRetention",
+          EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid = to_regclass('sample_store_orders')
+              AND conname = 'sample_store_orders_status_check'
+              AND pg_get_constraintdef(oid) LIKE '%abandoned%'
+          ) AS "reclaimStatus"
       `;
       return Boolean(
         rows[0]?.orders &&
@@ -234,7 +290,10 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
           rows[0]?.activeCheckout &&
           rows[0]?.pendingDeliveries &&
           rows[0]?.pendingReference &&
-          rows[0]?.pendingRetention,
+          rows[0]?.pendingRetention &&
+          // Without 004 the admission path's reclaim would fail the status CHECK and
+          // take /charge down with it, so an un-migrated database is not ready.
+          rows[0]?.reclaimStatus,
       );
     },
     getUsage: async () => {
@@ -245,6 +304,11 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
             FROM sample_store_orders
             WHERE status IN ('awaiting_payment', 'payment_submitted')
           ) AS "activeCheckout",
+          (
+            SELECT floor(extract(epoch FROM now() - max(updated_at)))::int
+            FROM sample_store_orders
+            WHERE status IN ('awaiting_payment', 'payment_submitted')
+          ) AS "activeCheckoutAgeSeconds",
           count(*) FILTER (
             WHERE created_at >= (
               date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
@@ -256,11 +320,31 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
           )::int AS "transactionsUsedToday"
         FROM sample_store_orders
       `;
-      return rows[0] ?? { activeCheckout: false, transactionsUsedToday: 0 };
+      return (
+        rows[0] ?? {
+          activeCheckout: false,
+          activeCheckoutAgeSeconds: null,
+          transactionsUsedToday: 0,
+        }
+      );
     },
     createOrGetWithinCap: async (order, transactionCap) =>
       sql.begin(async (transaction) => {
         await transaction`SELECT pg_advisory_xact_lock(${TRANSACTION_CAP_LOCK_KEY})`;
+        // Under the advisory lock taken above, so two concurrent admissions still
+        // produce exactly one winner. Reclaiming here rather than on a timer or a reset
+        // route is what makes the store self-healing: the next checkout attempt after
+        // the window clears the claim itself. It runs BEFORE the lookup below so that a
+        // retry of the stuck checkout reclaims it too, and is then answered as closed
+        // rather than submitted for payment against an order that can no longer
+        // reconcile.
+        await transaction`
+          UPDATE sample_store_orders
+          SET status = 'abandoned', updated_at = now()
+          WHERE status IN ('awaiting_payment', 'payment_submitted')
+            AND updated_at
+              < now() - ${ABANDONED_CHECKOUT_AFTER_SECONDS} * interval '1 second'
+        `;
         const existingRows = await transaction<StoredOrder[]>`
           SELECT
             checkout_id AS "checkoutId",
@@ -380,7 +464,7 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
               UPDATE sample_store_orders
               SET status = ${delivery.status}, updated_at = now()
               WHERE checkout_id = ${checkoutId}
-                AND status IN ('awaiting_payment', 'payment_submitted')
+                AND status NOT IN ('paid', 'payment_failed')
             `;
             terminalApplied = true;
           }
@@ -399,7 +483,7 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
         UPDATE sample_store_orders
         SET status = 'payment_failed', updated_at = now()
         WHERE checkout_id = ${checkoutId}
-          AND status IN ('awaiting_payment', 'payment_submitted')
+          AND status NOT IN ('paid', 'payment_failed')
       `;
       if (rows.count === 1) return 'applied' as const;
       const existing = await getOrder(sql, checkoutId);
@@ -478,11 +562,15 @@ export function createPostgresOrderStore(sql: Sql): OrderStore {
           ON CONFLICT (delivery_hash) DO NOTHING
         `;
         if (deliveries.count === 0) return 'duplicate' as const;
+        // NOT IN the terminal pair rather than IN the claim pair: a checkout reclaimed
+        // as `abandoned` is exactly the case this ticket exists for, and its late
+        // terminal delivery must still land. `abandoned` asserts no outcome, so there is
+        // nothing here to overwrite.
         const updated = await transaction`
           UPDATE sample_store_orders
           SET status = ${input.status}, updated_at = now()
           WHERE checkout_id = ${order.checkoutId}
-            AND status IN ('awaiting_payment', 'payment_submitted')
+            AND status NOT IN ('paid', 'payment_failed')
         `;
         return updated.count === 1 ? 'applied' as const : 'terminal_noop' as const;
       }),
@@ -513,6 +601,15 @@ async function lockPaymentReference(
 
 function isTerminal(status: OrderStatus): status is 'paid' | 'payment_failed' {
   return status === 'paid' || status === 'payment_failed';
+}
+
+/**
+ * Whether a status holds the single-active-checkout claim. The same two statuses spell
+ * the predicate of `sample_store_orders_single_active_idx`; `abandoned` is outside it,
+ * which is the whole of how a reclaimed checkout stops blocking the store.
+ */
+function holdsClaim(status: OrderStatus): boolean {
+  return status === 'awaiting_payment' || status === 'payment_submitted';
 }
 
 function startOfUtcDay(value: Date): Date {

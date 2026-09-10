@@ -866,6 +866,8 @@ test('local tutorial needs only Test keys and permits one non-durable checkout p
     transactionCap: 1,
     transactionsUsedToday: 0,
     activeCheckout: false,
+    activeCheckoutAgeSeconds: null,
+    abandonCheckoutAfterSeconds: 900,
     durableOrders: false,
     authenticWebhooks: false,
     trustedDemoProvenance: false,
@@ -1082,4 +1084,188 @@ test('a settled charge sends no client secret at all', async () => {
   // hands this back gives the embed nothing to do.
   assert.equal(response.body.paymentStatus, 'succeeded');
   assert.equal(Object.hasOwn(response.body, 'clientSecret'), false);
+});
+
+test('a claim nothing has advanced inside the window still blocks the next checkout', async () => {
+  const now = new Date('2026-09-04T12:00:00.000Z');
+  const gateway = new FakeGateway();
+  const store = createMemoryOrderStore({ now: () => now });
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    {
+      store,
+      referenceSecret: 'private-reference-secret-for-tests',
+      webhookSecret: 'whsec_test_receiver',
+    },
+  );
+  const secondInput = { ...baseInput, checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72' };
+  const firstQuote = await getQuoteToken(app, baseInput);
+  const secondQuote = await getQuoteToken(app, secondInput);
+
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken: firstQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+  const blocked = await request(app)
+    .post('/charge')
+    .send({ ...secondInput, quoteToken: secondQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(409);
+
+  assert.equal(blocked.body.code, 'checkout_in_progress');
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'payment_submitted');
+  assert.equal(await store.getByCheckoutId(secondInput.checkoutId), undefined);
+});
+
+test('a claim held past the window is reclaimed by the next checkout, and the row is kept', async () => {
+  let now = new Date('2026-09-04T12:00:00.000Z');
+  const gateway = new UniquePaymentGateway();
+  const store = createMemoryOrderStore({ now: () => now });
+  const createStoreApp = () =>
+    createApp(
+      { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+      gateway,
+      'unit-test-signing-secret',
+      {
+        store,
+        referenceSecret: 'private-reference-secret-for-tests',
+        webhookSecret: 'whsec_test_receiver',
+      },
+    );
+  const secondInput = { ...baseInput, checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72' };
+
+  const first = createStoreApp();
+  await request(first)
+    .post('/charge')
+    .send({
+      ...baseInput,
+      quoteToken: await getQuoteToken(first, baseInput),
+      paymentMethodId: 'pm_test_4242',
+    })
+    .expect(200);
+
+  // One second past the window, with nothing having advanced the order since.
+  now = new Date(now.getTime() + (900 + 1) * 1000);
+  const second = createStoreApp();
+  await request(second)
+    .post('/charge')
+    .send({
+      ...secondInput,
+      quoteToken: await getQuoteToken(second, secondInput),
+      paymentMethodId: 'pm_test_4242',
+    })
+    .expect(200);
+
+  // The reclaimed order is retained for audit, holding no claim; the new one holds it.
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'abandoned');
+  assert.equal(
+    (await store.getByCheckoutId(secondInput.checkoutId))?.status,
+    'payment_submitted',
+  );
+  assert.equal((await store.getUsage()).activeCheckout, true);
+});
+
+test('a terminal webhook still reconciles a checkout whose claim was reclaimed', async () => {
+  let now = new Date('2026-09-04T12:00:00.000Z');
+  const gateway = new UniquePaymentGateway();
+  const referenceSecret = 'private-reference-secret-for-tests';
+  const store = createMemoryOrderStore({ now: () => now });
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    { store, referenceSecret, webhookSecret: 'whsec_test_receiver' },
+  );
+  const secondInput = { ...baseInput, checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72' };
+  const firstQuote = await getQuoteToken(app, baseInput);
+  const secondQuote = await getQuoteToken(app, secondInput);
+
+  await request(app)
+    .post('/charge')
+    .send({ ...baseInput, quoteToken: firstQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+  const strandedPaymentId = gateway.paymentIds[0]!;
+
+  // The store carried on: the next shopper past the window reclaims and is admitted.
+  now = new Date(now.getTime() + (900 + 1) * 1000);
+  await request(app)
+    .post('/charge')
+    .send({ ...secondInput, quoteToken: secondQuote, paymentMethodId: 'pm_test_4242' })
+    .expect(200);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'abandoned');
+
+  // The delivery that never verified during the outage, arriving after the reclaim. It
+  // reconciles the order it belongs to and leaves the live checkout alone.
+  assert.equal(
+    await store.applyWebhook({
+      deliveryHash: 'late-terminal-delivery',
+      paymentReferenceHash: createHmac('sha256', referenceSecret)
+        .update(strandedPaymentId)
+        .digest('hex'),
+      status: 'paid',
+      occurredAt: new Date('2026-09-04T12:05:00.000Z'),
+    }),
+    'applied',
+  );
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'paid');
+  assert.equal(
+    (await store.getByCheckoutId(secondInput.checkoutId))?.status,
+    'payment_submitted',
+  );
+});
+
+test('a reclaimed checkout is closed rather than resumed, and /health reports the claim age', async () => {
+  let now = new Date('2026-09-04T12:00:00.000Z');
+  const gateway = new UniquePaymentGateway();
+  const store = createMemoryOrderStore({ now: () => now });
+  const app = createApp(
+    { publishableKey: 'pk_test_public_example', transactionCap: 50 },
+    gateway,
+    'unit-test-signing-secret',
+    {
+      store,
+      referenceSecret: 'private-reference-secret-for-tests',
+      webhookSecret: 'whsec_test_receiver',
+    },
+  );
+  const secondInput = { ...baseInput, checkoutId: '018f4f31-86d4-7b2e-b6bd-7f53f5f98c72' };
+  const chargeBody = {
+    ...baseInput,
+    quoteToken: await getQuoteToken(app, baseInput),
+    paymentMethodId: 'pm_test_4242',
+  };
+  await request(app).post('/charge').send(chargeBody).expect(200);
+
+  // Held but not yet past the window: /health says how long, and against what.
+  now = new Date(now.getTime() + 600 * 1000);
+  const held = await request(app).get('/health').expect(200);
+  assert.equal(held.body.activeCheckout, true);
+  assert.equal(held.body.activeCheckoutAgeSeconds, 600);
+  assert.equal(held.body.abandonCheckoutAfterSeconds, 900);
+
+  // Another shopper past the window takes the claim, which reclaims the stuck order.
+  now = new Date(now.getTime() + (900 + 1) * 1000);
+  await request(app)
+    .post('/charge')
+    .send({
+      ...secondInput,
+      quoteToken: await getQuoteToken(app, secondInput),
+      paymentMethodId: 'pm_test_4242',
+    })
+    .expect(200);
+
+  // Only now can the first shopper's own retry reach a reclaimed order, and it is told
+  // to start a new checkout rather than submitting against one that can never reconcile.
+  const resumed = await request(app).post('/charge').send(chargeBody).expect(409);
+  assert.equal(resumed.body.code, 'checkout_closed');
+  assert.equal(resumed.body.checkoutClosed, true);
+  assert.equal((await store.getByCheckoutId(checkoutId))?.status, 'abandoned');
+  // The retry submitted no second payment for the reclaimed order.
+  assert.equal(gateway.paymentCalls.length, 2);
+
+  // The claim now belongs to the live checkout, and its age is measured from it.
+  const reclaimed = await request(app).get('/health').expect(200);
+  assert.equal(reclaimed.body.activeCheckout, true);
+  assert.equal(reclaimed.body.activeCheckoutAgeSeconds, 0);
 });

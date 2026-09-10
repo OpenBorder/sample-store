@@ -11,6 +11,7 @@ import {
   type TaxQuoteResponse,
 } from '@open-border/node';
 import {
+  ABANDONED_CHECKOUT_AFTER_SECONDS,
   createMemoryOrderStore,
   createPostgresOrderStore,
   type OrderStore,
@@ -426,7 +427,11 @@ export function createApp(
         ? store
             .getUsage()
             .catch(() => null)
-        : { activeCheckout: false, transactionsUsedToday: 0 },
+        : {
+            activeCheckout: false,
+            activeCheckoutAgeSeconds: null,
+            transactionsUsedToday: 0,
+          },
       hasTrustedCustomApiProvenance(client, 'USD'),
     ]);
     const durableStoreReady = storeReady && usage !== null;
@@ -437,6 +442,11 @@ export function createApp(
       transactionCap,
       transactionsUsedToday: usage?.transactionsUsedToday ?? 0,
       activeCheckout: usage?.activeCheckout ?? false,
+      // An age past the window says the next checkout attempt will reclaim the claim
+      // itself — which is the difference between reading this and opening a database
+      // session to find out why the store is refusing every checkout.
+      activeCheckoutAgeSeconds: usage?.activeCheckoutAgeSeconds ?? null,
+      abandonCheckoutAfterSeconds: ABANDONED_CHECKOUT_AFTER_SECONDS,
       durableOrders: durableStoreReady,
       authenticWebhooks: authenticWebhooks && durableStoreReady,
       trustedDemoProvenance,
@@ -592,6 +602,21 @@ export function createApp(
           ok: false,
           code: 'checkout_closed',
           message: 'This test checkout is already closed. Start a new checkout.',
+          checkoutClosed: true,
+          requestId: res.locals.requestId,
+        });
+        return;
+      }
+      // Reclaimed after going unreconciled. It cannot resume: another checkout may hold
+      // the claim by now, and the store refuses to hand a reclaimed order the claim
+      // back. Answered as closed so the embed's existing terminal branch starts a new
+      // checkout, rather than submitting a payment this order could never reconcile.
+      if (order.status === 'abandoned') {
+        res.status(409).json({
+          ok: false,
+          code: 'checkout_closed',
+          message:
+            'This test checkout went unreconciled for too long and was closed. Start a new checkout.',
           checkoutClosed: true,
           requestId: res.locals.requestId,
         });
